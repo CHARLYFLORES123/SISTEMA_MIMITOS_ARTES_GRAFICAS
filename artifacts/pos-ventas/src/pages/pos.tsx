@@ -19,6 +19,7 @@ import { BoletaModal } from "@/components/boleta-modal";
 import { emailBoleta } from "@/lib/generate-boleta";
 import { Toast, Swal } from "@/lib/swal";
 import { getToken } from "@/lib/auth";
+import { usePermissions } from "@/hooks/use-permissions";
 
 const API_URL = (import.meta.env.VITE_API_URL || `${window.location.origin}/api`).replace(/\/$/, "");
 async function apiFetch(path: string, opts: RequestInit = {}) {
@@ -124,6 +125,7 @@ interface PosReservation {
 
 export default function POS() {
   const [, setLocation] = useLocation();
+  const { user } = usePermissions();
   const [search, setSearch] = useState("");
   const [categoryId, setCategoryId] = useState<number | null>(null);
   const [cart, setCart] = useState<CartItem[]>([]);
@@ -929,7 +931,7 @@ export default function POS() {
           customerName: selectedCustomerSnapshot?.name ?? (sale as any).customerName ?? null,
           customerNitCi: selectedCustomerSnapshot?.nitCi ?? (sale as any).customerNitCi ?? null,
           customerPhone: selectedCustomerSnapshot?.phone ?? (sale as any).customerPhone ?? null,
-          userName: null,
+          userName: (sale as any).userName ?? user?.name ?? null,
           subtotal: sale.subtotal,
           iva: sale.iva,
           total: sale.total,
@@ -938,7 +940,7 @@ export default function POS() {
           changeDue: sale.changeDue !== undefined && sale.changeDue !== null ? Number(sale.changeDue) : computedChange,
           status: sale.status,
           notes: notesWithPoints,
-          createdAt: sale.createdAt,
+          createdAt: sale.createdAt || new Date().toISOString(),
           pointsEarned: earned,
           details: cartSnapshot.map((item, idx) => ({
             id: idx + 1,
@@ -1064,7 +1066,7 @@ export default function POS() {
         customerName: linkedReservation.customerName,
         customerNitCi: null,
         customerPhone: linkedReservation.customerPhone ?? null,
-        userName: null,
+        userName: sale.userName ?? user?.name ?? null,
         subtotal: sale.subtotal,
         iva: sale.iva,
         total: sale.total,
@@ -1073,7 +1075,7 @@ export default function POS() {
         changeDue: sale.changeDue,
         status: sale.status,
         notes: sale.notes,
-        createdAt: sale.createdAt,
+        createdAt: sale.createdAt || new Date().toISOString(),
         pointsEarned: 0,
         details: sale.details.map((detail: { id: number; productName: string; quantity: number; unitPrice: number; subtotal: number }) => ({
           id: detail.id,
