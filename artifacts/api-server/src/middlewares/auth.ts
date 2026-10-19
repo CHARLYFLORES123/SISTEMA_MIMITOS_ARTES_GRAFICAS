@@ -35,7 +35,8 @@ export function signToken(userId: number, role: string, name?: string): string {
 }
 
 export function requireAdmin(req: AuthRequest, res: Response, next: NextFunction): void {
-  if (req.userRole?.toLowerCase() !== "admin") {
+  const role = req.userRole?.toLowerCase();
+  if (role !== "admin" && role !== "administrador") {
     res.status(403).json({ message: "Acceso denegado: se requiere rol Admin" });
     return;
   }

@@ -54,8 +54,9 @@ export default function CierreCaja() {
 
   const { currencySymbol } = useCurrency();
   const { data: settings } = useGetBusinessSettings();
-  const { role } = usePermissions();
+  const { role, user } = usePermissions();
   const canAuthorizeExpenses = ["admin", "inventario"].includes(role.toLowerCase());
+  const isSeller = role.toLowerCase() === "vendedor";
   const queryClient = useQueryClient();
   const { data: registerSession, isLoading: registerLoading, error: registerError } = useQuery<CashRegisterSession>({
     queryKey: ["/api/cash-register", date],
@@ -127,7 +128,11 @@ export default function CierreCaja() {
   };
 
   const { data: rawSales = [], isLoading } = useGetSales(
-    { dateFrom: date, dateTo: date },
+    {
+      dateFrom: date,
+      dateTo: date,
+      ...(isSeller && user?.id ? { userId: user.id } : {}),
+    },
     { query: { enabled: !!date } as any }
   );
 

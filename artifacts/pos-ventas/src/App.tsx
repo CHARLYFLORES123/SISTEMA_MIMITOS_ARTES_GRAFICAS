@@ -91,6 +91,7 @@ import CustomerStatement from "@/pages/customer-statement";
 import Loyalty from "@/pages/loyalty";
 import LoyaltySummary from "@/pages/loyalty-summary";
 import Audit from "@/pages/audit";
+import Reservations from "@/pages/reservations";
 
 const queryClient = new QueryClient();
 
@@ -105,6 +106,7 @@ function AuthenticatedRoutes() {
         <Route path="/customers" component={Customers} />
         <Route path="/sales" component={Sales} />
         <Route path="/sales/:id" component={SaleDetail} />
+        <Route path="/reservations" component={Reservations} />
         <Route path="/inventory" component={Inventory} />
         <Route path="/brands" component={Brands} />
         <Route path="/suppliers" component={Suppliers} />

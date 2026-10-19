@@ -418,3 +418,37 @@ INSERT INTO "users" ("name", "email", "password_hash", "role") VALUES
 ('Inventario Demo', 'inventario@demo.com', '$2b$10$wbWJlZ2qUkeaRZHoyy4rdeoCCD.Qwg78ekdCAVVxFgcf5yi/Fxl8y', 'inventario'),
 ('Compras Demo', 'compras@demo.com', '$2b$10$Jw7dZ0s4vhSj67NMn23kM..M5sErP6eNGuZ0lSjFf5nQbASblSQqK', 'compras')
 ON CONFLICT ("email") DO NOTHING;
+
+-- Reservas de productos personalizados
+CREATE TABLE IF NOT EXISTS "reservations" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "customer_id" integer REFERENCES "customers"("id") ON DELETE SET NULL,
+  "user_id" integer REFERENCES "users"("id") ON DELETE SET NULL,
+  "status" varchar(30) DEFAULT 'reserva' NOT NULL,
+  "total" numeric(12, 2) NOT NULL,
+  "deposit" numeric(12, 2) DEFAULT '0' NOT NULL,
+  "deposit_method" varchar(100),
+  "reservation_date" date DEFAULT now() NOT NULL,
+  "expected_at" date,
+  "notes" text,
+  "sale_id" integer REFERENCES "sales"("id") ON DELETE SET NULL,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE "reservations"
+  ADD COLUMN IF NOT EXISTS "reservation_date" date DEFAULT now() NOT NULL;
+
+CREATE TABLE IF NOT EXISTS "reservation_details" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "reservation_id" integer NOT NULL REFERENCES "reservations"("id") ON DELETE CASCADE,
+  "product_id" integer REFERENCES "products"("id") ON DELETE SET NULL,
+  "product_name" varchar(300) NOT NULL,
+  "specifications" text NOT NULL,
+  "quantity" integer NOT NULL,
+  "unit_price" numeric(12, 2) NOT NULL,
+  "subtotal" numeric(12, 2) NOT NULL,
+  "status" varchar(30) DEFAULT 'reserva' NOT NULL,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);

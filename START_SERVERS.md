@@ -30,7 +30,7 @@ VITE v7.3.6  ready in 906 ms
 
 ```powershell
 cd "c:\Users\HP VICTUS-CORE I7\Documents\PROYECTO_SOFTWARE_VENTAS\artifacts\api-server"
-$env:DATABASE_URL="postgresql://postgres:12345@localhost:5432/base_datos_venta_ropa"
+$env:DATABASE_URL="postgresql://postgres:12345@localhost:5432/bd_mimitos_artes_graficas"
 $env:PORT="5000"
 $env:NODE_ENV="development"
 $env:JWT_SECRET="25712087eacbfd85c4551de93aaace104a462228de6d63d4cd1aebabdc2586c3"
@@ -87,7 +87,7 @@ taskkill /PID <PID> /F        # Terminar el proceso
 ## ✅ Checklist de Ejecución
 
 - [x] Node.js + pnpm instalados
-- [x] PostgreSQL corriendo con base `base_datos_venta_ropa`
+- [x] PostgreSQL corriendo con base `bd_mimitos_artes_graficas`
 - [x] `.env` configurado con DATABASE_URL, PORT, JWT_SECRET
 - [x] Dependencias instaladas (`pnpm install`)
 - [x] Módulos nativos Windows instalados

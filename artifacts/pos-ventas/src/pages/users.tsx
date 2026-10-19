@@ -22,6 +22,7 @@ const ROLES = [
   { value: "vendedor",   label: "Vendedor" },
   { value: "inventario", label: "Inventario" },
   { value: "compras",    label: "Compras" },
+  { value: "diseñador",  label: "Diseñador" },
 ];
 
 const ROLE_BADGE: Record<string, string> = {
@@ -29,20 +30,22 @@ const ROLE_BADGE: Record<string, string> = {
   vendedor:   "secondary",
   inventario: "outline",
   compras:    "outline",
+  diseñador:  "secondary",
 };
 
 const schema = z.object({
   name: z.string().min(2, "Requerido"),
   email: z.string().email("Email inválido"),
   password: z.string().optional(),
-  role: z.enum(["admin", "vendedor", "inventario", "compras"]),
+  role: z.enum(["admin", "vendedor", "inventario", "compras", "diseñador"]),
 });
 
 const ROLE_PERMISSIONS_SUMMARY: Record<string, string> = {
   admin:      "Acceso completo",
-  vendedor:   "Ventas: crear · Clientes · Reportes · Fidelización",
+  vendedor:   "Ventas · Cierre de caja · Reservas · Clientes · Reportes · Fidelización",
   inventario: "Productos/Categorías/Marcas: crear, editar",
   compras:    "Proveedores: crear, editar · Cotizaciones: crear",
+  diseñador:  "Pedidos activos: cambiar etapa a producción y listo para entrega",
 };
 
 export default function Users() {
@@ -86,7 +89,7 @@ export default function Users() {
   const handleOpenEdit = (user: any) => {
     setEditingId(user.id);
     const role = user.role?.toLowerCase();
-    const validRole = ["admin", "vendedor", "inventario", "compras"].includes(role) ? role : "vendedor";
+    const validRole = ["admin", "vendedor", "inventario", "compras", "diseñador"].includes(role) ? role : "vendedor";
     form.reset({ name: user.name, email: user.email, password: "", role: validRole });
     setIsOpen(true);
   };

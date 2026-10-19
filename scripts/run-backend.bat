@@ -10,7 +10,7 @@ cd /d "%~dp0..\artifacts\api-server"
 :: Variables de entorno del Backend
 set "PORT=5000"
 set "NODE_ENV=development"
-set "DATABASE_URL=postgresql://postgres:12345@localhost:5432/base_datos_venta_ropa"
+set "DATABASE_URL=postgresql://postgres:12345@localhost:5432/bd_mimitos_artes_graficas"
 set "JWT_SECRET=25712087eacbfd85c4551de93aaace104a462228de6d63d4cd1aebabdc2586c3"
 set "VITE_API_URL=http://localhost:5000/api"
 
@@ -20,9 +20,13 @@ echo                Puerto: 5000  ^|  Base: http://localhost:5000/api
 echo =====================================================================
 echo.
 
-if not exist "dist\index.mjs" (
-    echo [INFO] Compilando Backend API...
-    call node build.mjs
+echo [INFO] Compilando Backend API con las rutas y cambios actuales...
+call node build.mjs
+if errorlevel 1 (
+    echo.
+    echo [ERROR] No se pudo compilar el Backend API.
+    pause
+    exit /b 1
 )
 
 node --enable-source-maps ./dist/index.mjs

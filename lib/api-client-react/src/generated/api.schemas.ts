@@ -266,10 +266,6 @@ export interface CreateSaleBody {
   /** @nullable */
   changeDue?: number | null;
   /** @nullable */
-  amountPaid?: number | null;
-  /** @nullable */
-  changeDue?: number | null;
-  /** @nullable */
   notes?: string | null;
 }
 

@@ -29,16 +29,9 @@ function fmtPublic(s: any) {
 async function ensureSettings() {
   const [existing] = await db.select().from(businessSettingsTable).limit(1);
   if (existing) {
-    if (existing.loyaltyEnabled === false) {
-      const [updated] = await db.update(businessSettingsTable)
-        .set({ loyaltyEnabled: true })
-        .where(eq(businessSettingsTable.id, existing.id))
-        .returning();
-      return updated;
-    }
     return existing;
   }
-  const [created] = await db.insert(businessSettingsTable).values({ loyaltyEnabled: true }).returning();
+  const [created] = await db.insert(businessSettingsTable).values({ loyaltyEnabled: false }).returning();
   return created;
 }
 
@@ -60,10 +53,33 @@ router.get("/", async (req, res) => {
   } catch (err) { req.log.error({ err }, "GetBusinessSettings error"); res.status(500).json({ message: "Error interno" }); }
 });
 
+import { z } from "zod";
+
+const updateSettingsSchema = z.object({
+  companyName: z.string().min(1, "Razón social requerida").optional(),
+  rucNit: z.string().nullish(),
+  phone: z.string().nullish(),
+  email: z.string().nullish(),
+  address: z.string().nullish(),
+  logoUrl: z.string().nullish(),
+  currency: z.string().optional(),
+  currencySymbol: z.string().optional(),
+  loyaltyEnabled: z.boolean().optional(),
+  pointsPerUnit: z.coerce.number().int().optional(),
+  pointsRedemptionRate: z.coerce.number().optional(),
+  openCashDrawer: z.boolean().optional(),
+  cashDrawerOnlyCash: z.boolean().optional(),
+  printerName: z.string().nullish(),
+});
+
 // PUT — admin only
 router.put("/", requireAdmin, async (req, res) => {
-  const parsed = UpdateBusinessSettingsBody.safeParse(req.body);
-  if (!parsed.success) { res.status(400).json({ message: "Datos inválidos" }); return; }
+  const parsed = updateSettingsSchema.safeParse(req.body);
+  if (!parsed.success) {
+    req.log.warn({ issues: parsed.error.issues }, "UpdateBusinessSettings validation failed");
+    res.status(400).json({ message: "Datos inválidos", issues: parsed.error.issues });
+    return;
+  }
   try {
     const existing = await ensureSettings();
     const { pointsRedemptionRate, ...settingsData } = parsed.data;

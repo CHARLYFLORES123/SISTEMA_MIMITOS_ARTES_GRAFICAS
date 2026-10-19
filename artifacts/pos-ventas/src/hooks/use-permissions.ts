@@ -9,10 +9,12 @@ const ROLE_PERMISSIONS: Record<string, PermissionMap> = {
     "*": ["read", "create", "update", "delete", "cancel"],
   },
   vendedor: {
-    sales:     ["read", "create"],
-    customers: ["read", "create", "update"],
-    reports:   ["read"],
-    loyalty:   ["read", "create", "update"],
+    sales:        ["read", "create"],
+    customers:    ["read", "create", "update"],
+    reports:      ["read"],
+    loyalty:      ["read", "create", "update"],
+    reservations: ["read", "create", "update"],
+    cashRegister: ["read", "create", "update"],
   },
   inventario: {
     products:   ["read", "create", "update"],
@@ -24,6 +26,9 @@ const ROLE_PERMISSIONS: Record<string, PermissionMap> = {
     suppliers: ["read", "create", "update"],
     quotes:    ["read", "create"],
     inventory: ["read", "create"],
+  },
+  diseñador: {
+    reservations: ["read", "update"],
   },
 };
 
@@ -39,5 +44,5 @@ export function usePermissions() {
     return modulePerms.includes(action);
   }
 
-  return { can, role };
+  return { can, role, user };
 }

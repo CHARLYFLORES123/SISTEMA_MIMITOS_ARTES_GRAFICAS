@@ -208,7 +208,7 @@ router.post("/", canCreate, async (req: AuthRequest, res) => {
     let pointsEarned = 0;
     try {
       const [settings] = await db.select().from(businessSettingsTable).limit(1);
-      const loyaltyActive = settings?.loyaltyEnabled ?? true;
+      const loyaltyActive = Boolean(settings?.loyaltyEnabled);
       // Regla de negocio: si el cliente canjeó su descuento en esta venta,
       // no se le asignan puntos ni descuento adicional.
       const saleHadRedemption = Math.max(0, Number((req.body as any).discount ?? 0)) > 0;

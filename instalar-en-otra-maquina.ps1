@@ -23,7 +23,7 @@ Write-Host "=== 3/6 Configurando .env si falta ===" -ForegroundColor Cyan
 if (-not (Test-Path "$root\.env")) {
     $dbPass = Read-Host "Contraseña de PostgreSQL del usuario 'postgres'"
     @"
-DATABASE_URL="postgresql://postgres:$dbPass@localhost:5432/base_datos_venta_ropa"
+DATABASE_URL="postgresql://postgres:$dbPass@localhost:5432/bd_mimitos_artes_graficas"
 PORT=5000
 BASE_PATH="/"
 JWT_SECRET="25712087eacbfd85c4551de93aaace104a462228de6d63d4cd1aebabdc2586c3"
@@ -56,16 +56,16 @@ try {
         $env:PGPASSWORD = $matches[1]
     }
     # Intentar crear la base de datos si no existe
-    psql -U postgres -h localhost -p 5432 -tc "SELECT 1 FROM pg_database WHERE datname = 'base_datos_venta_ropa'" | Select-String "1" -Quiet | ForEach-Object {
+    psql -U postgres -h localhost -p 5432 -tc "SELECT 1 FROM pg_database WHERE datname = 'bd_mimitos_artes_graficas'" | Select-String "1" -Quiet | ForEach-Object {
         if (-not $_) {
-            Write-Host "Creando base de datos 'base_datos_venta_ropa'..." -ForegroundColor Yellow
-            psql -U postgres -h localhost -p 5432 -c "CREATE DATABASE base_datos_venta_ropa;"
+            Write-Host "Creando base de datos 'bd_mimitos_artes_graficas'..." -ForegroundColor Yellow
+            psql -U postgres -h localhost -p 5432 -c "CREATE DATABASE bd_mimitos_artes_graficas;"
         } else {
-            Write-Host "Base de datos 'base_datos_venta_ropa' ya existe." -ForegroundColor Green
+            Write-Host "Base de datos 'bd_mimitos_artes_graficas' ya existe." -ForegroundColor Green
         }
     }
 } catch {
-    Write-Host "Aviso: No se pudo verificar o crear la DB automáticamente con psql. Asegúrate de que PostgreSQL esté corriendo y la base de datos 'base_datos_venta_ropa' exista." -ForegroundColor Yellow
+    Write-Host "Aviso: No se pudo verificar o crear la DB automáticamente con psql. Asegúrate de que PostgreSQL esté corriendo y la base de datos 'bd_mimitos_artes_graficas' exista." -ForegroundColor Yellow
 }
 
 Write-Host "=== 5/6 Ejecutando migraciones (creando tablas) ===" -ForegroundColor Cyan

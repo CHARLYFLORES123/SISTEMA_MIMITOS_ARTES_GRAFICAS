@@ -94,6 +94,15 @@ export default function Settings() {
         Toast.fire({ icon: "success", title: "Configuración guardada exitosamente" });
         setCurrency(values.currency, values.currencySymbol);
         queryClient.invalidateQueries({ queryKey: ["/api/business-settings"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/loyalty"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/loyalty/balance"] });
+      },
+      onError: (err: any) => {
+        Toast.fire({
+          icon: "error",
+          title: "Error al guardar",
+          text: err?.message || "No se pudo guardar la configuración. Revisa tus permisos de administrador.",
+        });
       }
     });
   };

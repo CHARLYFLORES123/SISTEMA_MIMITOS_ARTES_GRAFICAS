@@ -124,6 +124,7 @@ pnpm run push
 cd ../..
 
 # Nota: El seed de usuarios demo se ejecuta automáticamente cuando se inicia el API server
+# En una instalación existente, vuelve a ejecutar el push para agregar las tablas de reservas.
 ```
 
 **Usuarios de demostración creados automáticamente:**

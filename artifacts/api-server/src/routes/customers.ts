@@ -9,6 +9,7 @@ const router = Router();
 router.use(verifyToken);
 
 const canWrite = requireRoles(["admin", "vendedor"]);
+const canCreate = requireRoles(["admin", "vendedor", "diseñador"]);
 
 function formatCustomer(c: any, totalPurchases = 0) {
   return {
@@ -48,7 +49,7 @@ router.get("/", async (req, res) => {
 });
 
 // POST /api/customers — vendedor + admin
-router.post("/", canWrite, async (req: AuthRequest, res) => {
+router.post("/", canCreate, async (req: AuthRequest, res) => {
   const parsed = CreateCustomerBody.safeParse(req.body);
   if (!parsed.success) { res.status(400).json({ message: "Datos inválidos" }); return; }
 

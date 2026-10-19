@@ -1,4 +1,4 @@
-import { pgTable, serial, integer, numeric, varchar, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, serial, integer, numeric, varchar, text, timestamp, date, uniqueIndex } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 import { customersTable } from "./customers";
@@ -65,6 +65,36 @@ export const saleDetailsTable = pgTable("sale_details", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+export const reservationsTable = pgTable("reservations", {
+  id: serial("id").primaryKey(),
+  customerId: integer("customer_id").references(() => customersTable.id, { onDelete: "set null" }),
+  userId: integer("user_id").references(() => usersTable.id, { onDelete: "set null" }),
+  status: varchar("status", { length: 30 }).notNull().default("reserva"),
+  total: numeric("total", { precision: 12, scale: 2 }).notNull(),
+  deposit: numeric("deposit", { precision: 12, scale: 2 }).notNull().default("0"),
+  depositMethod: varchar("deposit_method", { length: 100 }),
+  reservationDate: date("reservation_date").notNull().defaultNow(),
+  expectedAt: date("expected_at"),
+  notes: text("notes"),
+  saleId: integer("sale_id").references(() => salesTable.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => new Date()),
+});
+
+export const reservationDetailsTable = pgTable("reservation_details", {
+  id: serial("id").primaryKey(),
+  reservationId: integer("reservation_id").notNull().references(() => reservationsTable.id, { onDelete: "cascade" }),
+  productId: integer("product_id").references(() => productsTable.id, { onDelete: "set null" }),
+  productName: varchar("product_name", { length: 300 }).notNull(),
+  specifications: text("specifications").notNull(),
+  quantity: integer("quantity").notNull(),
+  unitPrice: numeric("unit_price", { precision: 12, scale: 2 }).notNull(),
+  subtotal: numeric("subtotal", { precision: 12, scale: 2 }).notNull(),
+  status: varchar("status", { length: 30 }).notNull().default("reserva"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => new Date()),
+});
+
 export const insertSaleSchema = createInsertSchema(salesTable).omit({ id: true, createdAt: true, updatedAt: true });
 export const insertSaleDetailSchema = createInsertSchema(saleDetailsTable).omit({ id: true, createdAt: true });
 export type InsertSale = z.infer<typeof insertSaleSchema>;
@@ -72,5 +102,7 @@ export type InsertSaleDetail = z.infer<typeof insertSaleDetailSchema>;
 export type Sale = typeof salesTable.$inferSelect;
 export type SaleDetail = typeof saleDetailsTable.$inferSelect;
 export type SalePayment = typeof salePaymentsTable.$inferSelect;
+export type Reservation = typeof reservationsTable.$inferSelect;
+export type ReservationDetail = typeof reservationDetailsTable.$inferSelect;
 export type CashRegisterSession = typeof cashRegisterSessionsTable.$inferSelect;
 export type CashRegisterExpense = typeof cashRegisterExpensesTable.$inferSelect;

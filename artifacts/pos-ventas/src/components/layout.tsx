@@ -27,6 +27,7 @@ import {
   Download,
   Moon,
   Sun,
+  ClipboardCheck,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -48,14 +49,16 @@ const ROLE_DEFAULT_ROUTE: Record<string, string> = {
   vendedor:   "/pos",
   inventario: "/products",
   compras:    "/suppliers",
+  diseñador:  "/reservations",
 };
 
 /** Paths a role is allowed to visit. Empty array = all allowed (admin). */
 const ROLE_ALLOWED_PREFIXES: Record<string, string[]> = {
   admin:      [],
-  vendedor:   ["/pos", "/sales", "/customers", "/reports", "/loyalty"],
+  vendedor:   ["/pos", "/sales", "/cierre-caja", "/reservations", "/customers", "/reports", "/loyalty"],
   inventario: ["/products", "/categories", "/brands", "/inventory"],
   compras:    ["/suppliers", "/quotes", "/inventory"],
+  diseñador:  ["/reservations"],
 };
 
 function isAllowed(role: string, path: string): boolean {
@@ -67,6 +70,13 @@ function isAllowed(role: string, path: string): boolean {
 // ── Navigation structure ──────────────────────────────────────────────────────
 
 const ALL_NAV_GROUPS = [
+  {
+    label: "Producción",
+    roles: ["admin", "diseñador", "vendedor"],
+    items: [
+      { href: "/reservations", label: "Reservas", icon: ClipboardCheck, roles: ["admin", "diseñador", "vendedor"] },
+    ],
+  },
   {
     label: "Principal",
     roles: ["admin"],
@@ -80,7 +90,7 @@ const ALL_NAV_GROUPS = [
     roles: ["admin", "vendedor"],
     items: [
       { href: "/sales",       label: "Historial",     icon: ShoppingCart, roles: ["admin", "vendedor"] },
-      { href: "/cierre-caja", label: "Cierre de Caja", icon: LockKeyhole, roles: ["admin"] },
+      { href: "/cierre-caja", label: "Cierre de Caja", icon: LockKeyhole, roles: ["admin", "vendedor"] },
       { href: "/quotes",      label: "Cotizaciones",  icon: FileText,     roles: ["admin", "compras"] },
       { href: "/reports",     label: "Reportes",      icon: BarChart2,    roles: ["admin", "vendedor"] },
     ],
@@ -217,6 +227,7 @@ export function Layout({ children }: { children: ReactNode }) {
 
   const NavItem = ({ item, onClick }: { item: { href: string; label: string; icon: React.ElementType }; onClick?: () => void }) => {
     const active = location === item.href || location.startsWith(item.href + "/");
+    const displayLabel = item.href === "/reservations" && userRole === "diseñador" ? "Pedidos activos" : item.label;
     return (
       <li>
         <Link href={item.href} onClick={onClick}>
@@ -226,7 +237,7 @@ export function Layout({ children }: { children: ReactNode }) {
               : "text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
           }`}>
             <item.icon className={`w-4 h-4 shrink-0 ${active ? "text-white" : "text-muted-foreground group-hover:text-sidebar-accent-foreground"}`} />
-            <span className="flex-1 truncate">{item.label}</span>
+            <span className="flex-1 truncate">{displayLabel}</span>
             {active && <ChevronRight className="w-3.5 h-3.5 text-white/70 shrink-0" />}
           </div>
         </Link>
@@ -301,7 +312,9 @@ export function Layout({ children }: { children: ReactNode }) {
               <Menu className="w-4 h-4" />
             </Button>
             <nav className="flex items-center text-sm text-muted-foreground">
-              <span className="font-medium text-foreground">{currentNavItem?.label || "POS Ventas"}</span>
+              <span className="font-medium text-foreground">
+                {location.startsWith("/reservations") && userRole === "diseñador" ? "Pedidos activos" : (currentNavItem?.label || "POS Ventas")}
+              </span>
             </nav>
           </div>
 

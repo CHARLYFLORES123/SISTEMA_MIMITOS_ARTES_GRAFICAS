@@ -249,7 +249,7 @@ router.get("/balance/:customerId", async (req, res) => {
       discountValue: +(points * redemptionRate).toFixed(2),
       redemptionRate,
       pointsPerUnit: settings?.pointsPerUnit ?? 1,
-      loyaltyEnabled: settings?.loyaltyEnabled ?? true,
+      loyaltyEnabled: Boolean(settings?.loyaltyEnabled),
       ...buildTierInfo(tier, lifetimeEarned),
     });
   } catch (err) {
