@@ -18,6 +18,7 @@ async function seedDemoUsers() {
     { name: "Vendedor Demo", email: "vendedor@demo.com", password: "vendedor123", role: "vendedor" },
     { name: "Inventario Demo", email: "inventario@demo.com", password: "inventario123", role: "inventario" },
     { name: "Compras Demo", email: "compras@demo.com", password: "compras123", role: "compras" },
+    { name: "Diseñador Demo", email: "disenador@demo.com", password: "disenador123", role: "diseñador" },
   ];
 
   for (const demo of demos) {

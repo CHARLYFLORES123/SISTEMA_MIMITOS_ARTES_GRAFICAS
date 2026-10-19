@@ -416,7 +416,8 @@ INSERT INTO "users" ("name", "email", "password_hash", "role") VALUES
 ('Administrador Demo', 'admin@demo.com', '$2b$10$p6A5b4a.pZll5gbMtjTEGOEurNPcSQNLJzyi8LGf7igTxYg4M2yLS', 'admin'),
 ('Vendedor Demo', 'vendedor@demo.com', '$2b$10$8blPn3ujxLIFjzkM3B8hsOMQvmHWlEnzjJIshGTz9XeAFFPpptX/e', 'vendedor'),
 ('Inventario Demo', 'inventario@demo.com', '$2b$10$wbWJlZ2qUkeaRZHoyy4rdeoCCD.Qwg78ekdCAVVxFgcf5yi/Fxl8y', 'inventario'),
-('Compras Demo', 'compras@demo.com', '$2b$10$Jw7dZ0s4vhSj67NMn23kM..M5sErP6eNGuZ0lSjFf5nQbASblSQqK', 'compras')
+('Compras Demo', 'compras@demo.com', '$2b$10$Jw7dZ0s4vhSj67NMn23kM..M5sErP6eNGuZ0lSjFf5nQbASblSQqK', 'compras'),
+('Diseñador Demo', 'disenador@demo.com', '$2b$10$dl5GKpkMiRRcHMn2xpw7y.2Bc67lUpCH/4FPO0uuohT6CeLLUTHeC', 'diseñador')
 ON CONFLICT ("email") DO NOTHING;
 
 -- Reservas de productos personalizados

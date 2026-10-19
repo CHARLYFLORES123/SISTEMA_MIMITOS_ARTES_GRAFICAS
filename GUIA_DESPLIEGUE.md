@@ -156,6 +156,7 @@ Al arrancar el servidor backend por primera vez contra la base de datos de Neon,
 | **Vendedor** | `vendedor@demo.com` | `vendedor123` |
 | **Inventario** | `inventario@demo.com` | `inventario123` |
 | **Compras** | `compras@demo.com` | `compras123` |
+| **Diseñador** | `disenador@demo.com` | `disenador123` |
 
 ---
 
