@@ -89,6 +89,9 @@ export default function Reservations() {
   const [saving, setSaving] = useState(false);
   const [savingCustomer, setSavingCustomer] = useState(false);
   const [updatingDetailId, setUpdatingDetailId] = useState<number | null>(null);
+  const [filterName, setFilterName] = useState("");
+  const [filterPhone, setFilterPhone] = useState("");
+  const [filterDate, setFilterDate] = useState("");
 
   const draftTotal = useMemo(() => details.reduce((sum, detail) => {
     const quantity = Number(detail.quantity) || 0;
@@ -197,6 +200,19 @@ export default function Reservations() {
   };
 
   const availableReservations = (reservations ?? []).filter((reservation) => reservation.status !== "entregada");
+
+  const filteredReservations = useMemo(() => {
+    const name = filterName.trim().toLowerCase();
+    const phone = filterPhone.trim().toLowerCase();
+    return availableReservations.filter((reservation) => {
+      if (name && !(reservation.customerName || "").toLowerCase().includes(name)) return false;
+      if (phone && !(reservation.customerPhone || "").toLowerCase().includes(phone)) return false;
+      if (filterDate && reservation.reservationDate !== filterDate) return false;
+      return true;
+    });
+  }, [availableReservations, filterName, filterPhone, filterDate]);
+
+  const hasFilters = Boolean(filterName.trim() || filterPhone.trim() || filterDate);
 
   return (
     <div className="space-y-5 pb-8">
@@ -341,8 +357,39 @@ export default function Reservations() {
       <section className="space-y-3">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold">{isDesigner ? "Listado de pedidos" : "Pedidos activos"}</h2>
-          <span className="text-sm text-muted-foreground">{availableReservations.length} pedidos</span>
+          <span className="text-sm text-muted-foreground">
+            {hasFilters ? `${filteredReservations.length} de ${availableReservations.length} pedidos` : `${availableReservations.length} pedidos`}
+          </span>
         </div>
+        <Card>
+          <CardContent className="p-3">
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <label className="space-y-1.5 text-sm">
+                <span className="font-medium">Nombre del cliente</span>
+                <Input value={filterName} onChange={(event) => setFilterName(event.target.value)} placeholder="Buscar por nombre..." />
+              </label>
+              <label className="space-y-1.5 text-sm">
+                <span className="font-medium">Nro. de teléfono</span>
+                <Input type="tel" value={filterPhone} onChange={(event) => setFilterPhone(event.target.value)} placeholder="Buscar por teléfono..." />
+              </label>
+              <label className="space-y-1.5 text-sm">
+                <span className="font-medium">Fecha de reserva</span>
+                <Input type="date" value={filterDate} onChange={(event) => setFilterDate(event.target.value)} />
+              </label>
+              <div className="flex items-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  onClick={() => { setFilterName(""); setFilterPhone(""); setFilterDate(""); }}
+                  disabled={!hasFilters}
+                >
+                  <X className="mr-2 h-4 w-4" /> Limpiar filtros
+                </Button>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
         {isLoading ? (
           <Card><CardContent className="py-8 text-center text-sm text-muted-foreground">Cargando reservas...</CardContent></Card>
         ) : isError ? (
@@ -353,9 +400,15 @@ export default function Reservations() {
             <p className="font-medium">No hay reservas activas</p>
             <p className="text-sm">Las reservas nuevas aparecerán aquí.</p>
           </CardContent></Card>
+        ) : filteredReservations.length === 0 ? (
+          <Card><CardContent className="flex flex-col items-center py-10 text-center text-muted-foreground">
+            <ClipboardCheck className="mb-2 h-9 w-9 opacity-30" />
+            <p className="font-medium">No se encontraron pedidos con esos filtros</p>
+            <p className="text-sm">Prueba con otro nombre, teléfono o fecha, o limpia los filtros.</p>
+          </CardContent></Card>
         ) : (
           <div className="space-y-3">
-            {availableReservations.map((reservation) => (
+            {filteredReservations.map((reservation) => (
               <Card key={reservation.id}>
                 <CardContent className="space-y-3 p-4">
                   <div className="flex flex-wrap items-start justify-between gap-3">

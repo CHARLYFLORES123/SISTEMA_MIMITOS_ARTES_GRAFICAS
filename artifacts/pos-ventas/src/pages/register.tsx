@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { AppFooter } from "@/components/app-footer";
 
 const registerSchema = z.object({
   name: z.string().min(2, "El nombre es muy corto"),
@@ -72,7 +73,7 @@ export default function Register() {
 
   return (
     <div
-      className="min-h-screen flex items-center justify-center p-4"
+      className="min-h-screen flex flex-col items-center justify-center p-4"
       style={{
         backgroundImage:
           "linear-gradient(rgba(15, 23, 42, 0.55), rgba(15, 23, 42, 0.55)), url('/images/logo.jpg')",
@@ -148,6 +149,8 @@ export default function Register() {
           </div>
         </CardContent>
       </Card>
+
+      <AppFooter />
     </div>
   );
 }

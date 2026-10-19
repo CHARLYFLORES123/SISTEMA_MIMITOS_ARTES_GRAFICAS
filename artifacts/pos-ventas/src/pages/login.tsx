@@ -8,6 +8,7 @@ import { setToken } from "@/lib/auth";
 import { useToast } from "@/hooks/use-toast";
 import { Input } from "@/components/ui/input";
 import { Eye, EyeOff, Building2 } from "lucide-react";
+import { AppFooter } from "@/components/app-footer";
 
 const loginSchema = z.object({
   email: z.string().email("Correo electrónico inválido"),
@@ -65,7 +66,7 @@ export default function Login() {
 
   return (
     <div
-      className="min-h-screen flex items-center justify-center p-4"
+      className="min-h-screen flex flex-col items-center justify-center p-4"
       style={{
         backgroundImage:
           "linear-gradient(rgba(15, 23, 42, 0.55), rgba(15, 23, 42, 0.55)), url('/images/logo.jpg')",
@@ -167,6 +168,8 @@ export default function Login() {
           </div>
         </div>
       </div>
+
+      <AppFooter />
     </div>
   );
 }
