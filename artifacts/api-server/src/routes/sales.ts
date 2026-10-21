@@ -177,7 +177,7 @@ router.post("/", canCreate, async (req: AuthRequest, res) => {
         const p = productMap.get(item.productId)!;
         await tx.insert(saleDetailsTable).values({
           saleId: sale.id, productId: item.productId, productName: formatProductLabel(p),
-          quantity: item.quantity, unitPrice: String(item.unitPrice.toFixed(2)),
+          quantity: String(item.quantity), unitPrice: String(item.unitPrice.toFixed(2)),
           subtotal: String((item.unitPrice * item.quantity).toFixed(2)),
         });
         await tx.update(productsTable)
@@ -283,7 +283,7 @@ router.get("/:id", async (req, res) => {
       pointsEarned,
       details: details.map(d => ({
         id: d.id, productId: d.productId ?? null, productName: d.productName,
-        quantity: d.quantity, unitPrice: Number(d.unitPrice), subtotal: Number(d.subtotal),
+        quantity: Number(d.quantity), unitPrice: Number(d.unitPrice), subtotal: Number(d.subtotal),
       })),
     });
   } catch (err) {
@@ -349,7 +349,7 @@ router.post("/:id/cancel", requireAdmin, async (req: AuthRequest, res) => {
       for (const d of details) {
         if (d.productId) {
           await tx.update(productsTable)
-            .set({ stock: sql`${productsTable.stock} + ${d.quantity}` })
+            .set({ stock: sql`${productsTable.stock} + ${Number(d.quantity)}` })
             .where(eq(productsTable.id, d.productId));
         }
       }

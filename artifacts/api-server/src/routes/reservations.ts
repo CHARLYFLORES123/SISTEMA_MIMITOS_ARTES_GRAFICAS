@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod/v4";
 import {
-  db, reservationsTable, reservationDetailsTable, productsTable, customersTable, usersTable,
+  db, reservationsTable, reservationDetailsTable, reservationPaymentsTable, productsTable, customersTable, usersTable,
   salesTable, saleDetailsTable, salePaymentsTable, cashRegisterSessionsTable,
 } from "@workspace/db";
 import { and, eq, inArray, sql } from "drizzle-orm";
@@ -19,14 +19,19 @@ const reservationStageSchema = z.enum(stageOrder);
 const createReservationSchema = z.object({
   customerId: z.number().int().positive().nullable().optional(),
   deposit: z.number().finite().nonnegative().max(9_999_999_999.99).default(0),
-  depositMethod: z.string().trim().max(100).optional().nullable(),
+  depositMethod: z.string().trim().max(255).optional().nullable(),
+  cashRegisterSessionId: z.number().int().positive().optional().nullable(),
+  payments: z.array(z.object({
+    paymentMethod: z.string().trim().min(1).max(100),
+    amount: z.number().finite().positive().max(9_999_999_999.99),
+  })).optional(),
   reservationDate: z.string().date().optional(),
   expectedAt: z.string().date().optional().nullable(),
   notes: z.string().trim().max(5000).optional().nullable(),
   details: z.array(z.object({
     productId: z.number().int().positive(),
     specifications: z.string().trim().min(1).max(5000),
-    quantity: z.number().int().positive(),
+    quantity: z.number().finite().positive().max(999_999_999.99),
     unitPrice: z.number().finite().nonnegative().max(9_999_999_999.99),
   })).min(1),
 });
@@ -42,7 +47,14 @@ const deliverSchema = z.object({
   discount: z.number().finite().nonnegative().max(9_999_999_999.99).optional().default(0),
 });
 
-function formatReservation(reservation: typeof reservationsTable.$inferSelect, details: Array<typeof reservationDetailsTable.$inferSelect>, customerName: string | null, customerPhone: string | null, userName: string | null) {
+function formatReservation(
+  reservation: typeof reservationsTable.$inferSelect,
+  details: Array<typeof reservationDetailsTable.$inferSelect>,
+  customerName: string | null,
+  customerPhone: string | null,
+  userName: string | null,
+  payments?: Array<{ paymentMethod: string; amount: number }>,
+) {
   return {
     id: reservation.id,
     customerId: reservation.customerId,
@@ -55,17 +67,19 @@ function formatReservation(reservation: typeof reservationsTable.$inferSelect, d
     deposit: Number(reservation.deposit),
     balance: Math.max(0, Number(reservation.total) - Number(reservation.deposit)),
     depositMethod: reservation.depositMethod,
+    cashRegisterSessionId: reservation.cashRegisterSessionId,
     reservationDate: reservation.reservationDate,
     expectedAt: reservation.expectedAt,
     notes: reservation.notes,
     saleId: reservation.saleId,
     createdAt: reservation.createdAt.toISOString(),
+    payments: payments ?? [],
     details: details.map((detail) => ({
       id: detail.id,
       productId: detail.productId,
       productName: detail.productName,
       specifications: detail.specifications,
-      quantity: detail.quantity,
+      quantity: Number(detail.quantity),
       unitPrice: Number(detail.unitPrice),
       subtotal: Number(detail.subtotal),
       status: detail.status,
@@ -89,7 +103,15 @@ async function fetchReservation(id: number) {
   const details = await db.select().from(reservationDetailsTable)
     .where(eq(reservationDetailsTable.reservationId, id))
     .orderBy(reservationDetailsTable.id);
-  return formatReservation(row.reservation, details, row.customerName, row.customerPhone, row.userName);
+  const payments = await db.select().from(reservationPaymentsTable)
+    .where(eq(reservationPaymentsTable.reservationId, id))
+    .orderBy(reservationPaymentsTable.id);
+  const paymentList = payments.length > 0
+    ? payments.map((p) => ({ paymentMethod: p.paymentMethod, amount: Number(p.amount) }))
+    : (Number(row.reservation.deposit) > 0
+      ? [{ paymentMethod: row.reservation.depositMethod || "Efectivo", amount: Number(row.reservation.deposit) }]
+      : []);
+  return formatReservation(row.reservation, details, row.customerName, row.customerPhone, row.userName, paymentList);
 }
 
 // GET /api/reservations
@@ -97,6 +119,8 @@ router.get("/", requireRoles(["admin", "diseñador", "vendedor"]), async (req: A
   try {
     const statusQuery = typeof req.query.status === "string" ? req.query.status.trim() : null;
     const filterStatus = statusQuery || null;
+    const expectedAtQuery = typeof req.query.expectedAt === "string" ? req.query.expectedAt.trim() : null;
+    const reservationDateQuery = typeof req.query.reservationDate === "string" ? req.query.reservationDate.trim() : null;
 
     const baseQuery = db.select({
       reservation: reservationsTable,
@@ -108,8 +132,13 @@ router.get("/", requireRoles(["admin", "diseñador", "vendedor"]), async (req: A
       .leftJoin(customersTable, eq(reservationsTable.customerId, customersTable.id))
       .leftJoin(usersTable, eq(reservationsTable.userId, usersTable.id));
 
-    const rows = filterStatus
-      ? await baseQuery.where(eq(reservationsTable.status, filterStatus)).orderBy(sql`${reservationsTable.createdAt} DESC`)
+    const conditions = [];
+    if (filterStatus) conditions.push(eq(reservationsTable.status, filterStatus));
+    if (expectedAtQuery) conditions.push(sql`CAST(${reservationsTable.expectedAt} AS text) = ${expectedAtQuery}`);
+    if (reservationDateQuery) conditions.push(sql`CAST(${reservationsTable.reservationDate} AS text) = ${reservationDateQuery}`);
+
+    const rows = conditions.length > 0
+      ? await baseQuery.where(and(...conditions)).orderBy(sql`${reservationsTable.createdAt} DESC`)
       : await baseQuery.orderBy(sql`${reservationsTable.createdAt} DESC`);
     const details = rows.length
       ? await db.select().from(reservationDetailsTable)
@@ -122,8 +151,26 @@ router.get("/", requireRoles(["admin", "diseñador", "vendedor"]), async (req: A
       values.push(detail);
       detailsByReservation.set(detail.reservationId, values);
     }
-    res.json(rows.map(({ reservation, customerName, customerPhone, userName }) =>
-      formatReservation(reservation, detailsByReservation.get(reservation.id) ?? [], customerName, customerPhone, userName)));
+
+    const reservationPayments = rows.length
+      ? await db.select().from(reservationPaymentsTable)
+        .where(inArray(reservationPaymentsTable.reservationId, rows.map(({ reservation }) => reservation.id)))
+        .orderBy(reservationPaymentsTable.id)
+      : [];
+    const paymentsByReservation = new Map<number, Array<{ paymentMethod: string; amount: number }>>();
+    for (const p of reservationPayments) {
+      const list = paymentsByReservation.get(p.reservationId) ?? [];
+      list.push({ paymentMethod: p.paymentMethod, amount: Number(p.amount) });
+      paymentsByReservation.set(p.reservationId, list);
+    }
+
+    res.json(rows.map(({ reservation, customerName, customerPhone, userName }) => {
+      let resPayments = paymentsByReservation.get(reservation.id);
+      if ((!resPayments || resPayments.length === 0) && Number(reservation.deposit) > 0) {
+        resPayments = [{ paymentMethod: reservation.depositMethod || "Efectivo", amount: Number(reservation.deposit) }];
+      }
+      return formatReservation(reservation, detailsByReservation.get(reservation.id) ?? [], customerName, customerPhone, userName, resPayments);
+    }));
   } catch (err) {
     req.log.error({ err }, "GetReservations error");
     res.status(500).json({ message: "Error interno" });
@@ -149,7 +196,7 @@ router.post("/", canManage, async (req: AuthRequest, res) => {
   const parsed = createReservationSchema.safeParse(req.body);
   if (!parsed.success) { res.status(400).json({ message: "Datos inválidos", errors: parsed.error.flatten() }); return; }
 
-  const { customerId, deposit, depositMethod, reservationDate, expectedAt, notes, details } = parsed.data;
+  const { customerId, deposit, depositMethod, payments, reservationDate, expectedAt, notes, details, cashRegisterSessionId } = parsed.data;
   const productIds = [...new Set(details.map((detail) => detail.productId))];
   try {
     const products = await db.select().from(productsTable).where(inArray(productsTable.id, productIds));
@@ -165,10 +212,12 @@ router.post("/", canManage, async (req: AuthRequest, res) => {
 
     const normalizedDetails = details.map((detail) => {
       const unitPrice = Number(detail.unitPrice.toFixed(2));
+      const quantity = Number(detail.quantity.toFixed(2));
       return {
         ...detail,
+        quantity,
         unitPrice,
-        subtotal: Number((unitPrice * detail.quantity).toFixed(2)),
+        subtotal: Number((unitPrice * quantity).toFixed(2)),
       };
     });
     const roundedTotal = Number(normalizedDetails.reduce((sum, detail) => sum + detail.subtotal, 0).toFixed(2));
@@ -178,17 +227,80 @@ router.post("/", canManage, async (req: AuthRequest, res) => {
       return;
     }
 
+    // Process split / mixed payments if provided
+    const splitPayments = (payments && payments.length > 0) ? payments : null;
+    let effectiveDepositMethod: string | null = null;
+    if (roundedDeposit > 0) {
+      if (splitPayments) {
+        const splitTotal = Number(splitPayments.reduce((acc, p) => acc + p.amount, 0).toFixed(2));
+        if (Math.abs(splitTotal - roundedDeposit) > 0.05) {
+          res.status(400).json({
+            message: `La suma de los pagos del adelanto (${splitTotal.toFixed(2)}) no coincide con el adelanto total (${roundedDeposit.toFixed(2)})`,
+          });
+          return;
+        }
+        effectiveDepositMethod = splitPayments.map((p) => `${p.paymentMethod}: ${p.amount.toFixed(2)}`).join(" / ");
+      } else {
+        effectiveDepositMethod = depositMethod?.trim() || "Efectivo";
+      }
+    }
+
     const reservation = await db.transaction(async (tx) => {
+      let targetSessionId = cashRegisterSessionId ?? null;
+
+      if (!targetSessionId && roundedDeposit > 0) {
+        const targetDate = reservationDate || new Date().toISOString().slice(0, 10);
+        // 1. Try finding open session for this user for target date
+        let [openSession] = await tx.select({ id: cashRegisterSessionsTable.id })
+          .from(cashRegisterSessionsTable)
+          .where(and(
+            eq(cashRegisterSessionsTable.userId, req.userId!),
+            eq(cashRegisterSessionsTable.businessDate, targetDate),
+            eq(cashRegisterSessionsTable.status, "open"),
+          ))
+          .limit(1);
+
+        // 2. If not found by date, find latest open session for this user
+        if (!openSession) {
+          [openSession] = await tx.select({ id: cashRegisterSessionsTable.id })
+            .from(cashRegisterSessionsTable)
+            .where(and(
+              eq(cashRegisterSessionsTable.userId, req.userId!),
+              eq(cashRegisterSessionsTable.status, "open"),
+            ))
+            .orderBy(sql`${cashRegisterSessionsTable.id} DESC`)
+            .limit(1);
+        }
+
+        // 3. If still not found (e.g. role is diseñador), find any open session in the system for this date
+        if (!openSession) {
+          [openSession] = await tx.select({ id: cashRegisterSessionsTable.id })
+            .from(cashRegisterSessionsTable)
+            .where(and(
+              eq(cashRegisterSessionsTable.businessDate, targetDate),
+              eq(cashRegisterSessionsTable.status, "open"),
+            ))
+            .orderBy(sql`${cashRegisterSessionsTable.id} DESC`)
+            .limit(1);
+        }
+
+        if (openSession) {
+          targetSessionId = openSession.id;
+        }
+      }
+
       const [created] = await tx.insert(reservationsTable).values({
         customerId: customerId ?? null,
         userId: req.userId ?? null,
         total: roundedTotal.toFixed(2),
         deposit: roundedDeposit.toFixed(2),
-        depositMethod: roundedDeposit > 0 ? depositMethod?.trim() || null : null,
+        depositMethod: effectiveDepositMethod,
+        cashRegisterSessionId: roundedDeposit > 0 ? targetSessionId : null,
         reservationDate,
         expectedAt: expectedAt ?? null,
         notes: notes?.trim() || null,
       }).returning();
+
       await tx.insert(reservationDetailsTable).values(normalizedDetails.map((detail) => {
         const product = productsById.get(detail.productId)!;
         return {
@@ -196,11 +308,31 @@ router.post("/", canManage, async (req: AuthRequest, res) => {
           productId: product.id,
           productName: formatProductLabel(product),
           specifications: detail.specifications.trim(),
-          quantity: detail.quantity,
+          quantity: detail.quantity.toFixed(2),
           unitPrice: detail.unitPrice.toFixed(2),
           subtotal: detail.subtotal.toFixed(2),
         };
       }));
+
+      // Record payments in reservationPaymentsTable
+      if (roundedDeposit > 0) {
+        if (splitPayments) {
+          for (const sp of splitPayments) {
+            await tx.insert(reservationPaymentsTable).values({
+              reservationId: created.id,
+              paymentMethod: sp.paymentMethod,
+              amount: sp.amount.toFixed(2),
+            });
+          }
+        } else {
+          await tx.insert(reservationPaymentsTable).values({
+            reservationId: created.id,
+            paymentMethod: depositMethod?.trim() || "Efectivo",
+            amount: roundedDeposit.toFixed(2),
+          });
+        }
+      }
+
       return created;
     });
 
@@ -208,7 +340,7 @@ router.post("/", canManage, async (req: AuthRequest, res) => {
     res.status(201).json(result);
     auditLog({
       req, action: "created", entity: "reservation", entityId: reservation.id,
-      entityName: `Reserva #${reservation.id}`, details: { total: roundedTotal, deposit: roundedDeposit },
+      entityName: `Reserva #${reservation.id}`, details: { total: roundedTotal, deposit: roundedDeposit, payments: splitPayments ?? effectiveDepositMethod },
     });
   } catch (err) {
     req.log.error({ err }, "CreateReservation error");
@@ -364,7 +496,7 @@ router.post("/:id/deliver", requireRoles(["admin", "vendedor"]), async (req: Aut
         saleId: sale.id,
         productId: detail.productId,
         productName: detail.productName,
-        quantity: detail.quantity,
+        quantity: String(detail.quantity),
         unitPrice: detail.unitPrice,
         subtotal: detail.subtotal,
       })));
@@ -432,7 +564,7 @@ router.post("/:id/deliver", requireRoles(["admin", "vendedor"]), async (req: Aut
       createdAt: result.sale.createdAt.toISOString(),
       details: saleDetails.map((detail) => ({
         id: detail.id, productId: detail.productId, productName: detail.productName,
-        quantity: detail.quantity, unitPrice: Number(detail.unitPrice), subtotal: Number(detail.subtotal),
+        quantity: Number(detail.quantity), unitPrice: Number(detail.unitPrice), subtotal: Number(detail.subtotal),
       })),
       pointsEarned: 0,
     });

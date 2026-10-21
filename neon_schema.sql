@@ -174,7 +174,7 @@ CREATE TABLE IF NOT EXISTS "sale_details" (
 	"sale_id" integer NOT NULL,
 	"product_id" integer,
 	"product_name" varchar(300) NOT NULL,
-	"quantity" integer NOT NULL,
+	"quantity" numeric(12, 2) NOT NULL,
 	"unit_price" numeric(12, 2) NOT NULL,
 	"subtotal" numeric(12, 2) NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
@@ -428,7 +428,8 @@ CREATE TABLE IF NOT EXISTS "reservations" (
   "status" varchar(30) DEFAULT 'reserva' NOT NULL,
   "total" numeric(12, 2) NOT NULL,
   "deposit" numeric(12, 2) DEFAULT '0' NOT NULL,
-  "deposit_method" varchar(100),
+  "deposit_method" varchar(255),
+  "cash_register_session_id" integer REFERENCES "cash_register_sessions"("id") ON DELETE SET NULL,
   "reservation_date" date DEFAULT now() NOT NULL,
   "expected_at" date,
   "notes" text,
@@ -446,10 +447,20 @@ CREATE TABLE IF NOT EXISTS "reservation_details" (
   "product_id" integer REFERENCES "products"("id") ON DELETE SET NULL,
   "product_name" varchar(300) NOT NULL,
   "specifications" text NOT NULL,
-  "quantity" integer NOT NULL,
+  "quantity" numeric(12, 2) NOT NULL,
   "unit_price" numeric(12, 2) NOT NULL,
   "subtotal" numeric(12, 2) NOT NULL,
   "status" varchar(30) DEFAULT 'reserva' NOT NULL,
   "created_at" timestamp with time zone DEFAULT now() NOT NULL,
   "updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS "reservation_payments" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "reservation_id" integer NOT NULL REFERENCES "reservations"("id") ON DELETE CASCADE,
+  "payment_method" varchar(100) NOT NULL,
+  "amount" numeric(12, 2) NOT NULL,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS "reservation_payments_reservation_id_idx" ON "reservation_payments" ("reservation_id");

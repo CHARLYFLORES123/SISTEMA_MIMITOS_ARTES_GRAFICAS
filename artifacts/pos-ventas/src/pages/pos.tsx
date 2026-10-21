@@ -134,6 +134,9 @@ export default function POS() {
   const [expectedAt, setExpectedAt] = useState<string>("");
   const [deposit, setDeposit] = useState<string>("0");
   const [depositMethod, setDepositMethod] = useState<string>("Efectivo");
+  const [isMixedDeposit, setIsMixedDeposit] = useState(false);
+  const [mixedDepositCash, setMixedDepositCash] = useState<string>("");
+  const [mixedDepositTransfer, setMixedDepositTransfer] = useState<string>("");
   const [isSavingReservation, setIsSavingReservation] = useState<boolean>(false);
   const [customerId, setCustomerId] = useState<string>("none");
   const [customerSearch, setCustomerSearch] = useState("");
@@ -1135,7 +1138,8 @@ export default function POS() {
     }
 
     const reservationTotal = cart.reduce((acc, i) => acc + i.quantity * i.unitPrice, 0);
-    const depositNum = Number(deposit) || 0;
+    const mixedDepositTotal = (Number(mixedDepositCash) || 0) + (Number(mixedDepositTransfer) || 0);
+    const depositNum = isMixedDeposit ? mixedDepositTotal : (Number(deposit) || 0);
 
     if (depositNum < 0) {
       Swal.fire({ icon: "warning", title: "Adelanto inválido", text: "El adelanto no puede ser negativo." });
@@ -1151,12 +1155,36 @@ export default function POS() {
       return;
     }
 
+    let finalDepositMethod: string | null = null;
+    let finalPayments: Array<{ paymentMethod: string; amount: number }> | undefined = undefined;
+
+    if (depositNum > 0) {
+      if (isMixedDeposit) {
+        const cashAmt = Number(mixedDepositCash) || 0;
+        const transAmt = Number(mixedDepositTransfer) || 0;
+        const paymentsList: Array<{ paymentMethod: string; amount: number }> = [];
+        if (cashAmt > 0) paymentsList.push({ paymentMethod: "Efectivo", amount: Number(cashAmt.toFixed(2)) });
+        if (transAmt > 0) paymentsList.push({ paymentMethod: "Transferencia", amount: Number(transAmt.toFixed(2)) });
+        if (paymentsList.length === 0) {
+          Swal.fire({ icon: "warning", title: "Monto requerido", text: "Ingresa el monto del adelanto en efectivo y/o transferencia." });
+          return;
+        }
+        finalPayments = paymentsList;
+        finalDepositMethod = paymentsList.map(p => `${p.paymentMethod}: ${p.amount.toFixed(2)}`).join(" / ");
+      } else {
+        finalDepositMethod = depositMethod.trim() || "Efectivo";
+        finalPayments = [{ paymentMethod: finalDepositMethod, amount: depositNum }];
+      }
+    }
+
     setIsSavingReservation(true);
     try {
       const payload = {
         customerId: parseInt(customerId),
         deposit: depositNum,
-        depositMethod: depositNum > 0 ? (depositMethod.trim() || "Efectivo") : null,
+        depositMethod: finalDepositMethod,
+        payments: finalPayments,
+        cashRegisterSessionId: cashRegister?.status === "open" ? cashRegister.id : undefined,
         reservationDate: reservationDate || localBusinessDate(),
         expectedAt: expectedAt || null,
         notes: notes.trim() || null,
@@ -1185,7 +1213,7 @@ export default function POS() {
             ${expectedAt ? `<p><b>Fecha estimada de entrega:</b> ${expectedAt}</p>` : ""}
             <p><b>Total de prendas / productos:</b> ${cart.reduce((s, i) => s + i.quantity, 0)} unid.</p>
             <p><b>Total reserva:</b> ${formatCurrency(res.total, currencySymbol)}</p>
-            <p><b>Adelanto pagado:</b> ${formatCurrency(res.deposit, currencySymbol)} ${depositNum > 0 && depositMethod ? `(${depositMethod})` : ""}</p>
+            <p><b>Adelanto pagado:</b> ${formatCurrency(res.deposit, currencySymbol)} ${depositNum > 0 && finalDepositMethod ? `(${finalDepositMethod})` : ""}</p>
             <p style="color: #047857; font-weight: bold; font-size: 14px;"><b>Saldo pendiente a la entrega:</b> ${formatCurrency(res.balance, currencySymbol)}</p>
           </div>
         `,
@@ -1198,6 +1226,9 @@ export default function POS() {
       setCustomerSearch("");
       setDeposit("0");
       setDepositMethod("Efectivo");
+      setIsMixedDeposit(false);
+      setMixedDepositCash("");
+      setMixedDepositTransfer("");
       setExpectedAt("");
       setNotes("");
       setCartMode("sale");
@@ -1205,6 +1236,7 @@ export default function POS() {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["/api/reservations"] }),
         queryClient.invalidateQueries({ queryKey: ["/api/dashboard/stats"] }),
+        queryClient.invalidateQueries({ queryKey: ["/api/cash-register"] }),
       ]);
       refetchReadyReservations();
     } catch (err: any) {
@@ -2188,33 +2220,98 @@ export default function POS() {
                 </label>
               </div>
 
-              <div className="grid grid-cols-2 gap-2 text-xs">
-                <label className="space-y-1">
-                  <span className="text-[10px] font-semibold text-amber-900 block">Adelanto ({currencySymbol})</span>
-                  <Input
-                    type="number"
-                    min="0"
-                    step="0.01"
-                    value={deposit}
-                    onChange={(e) => setDeposit(e.target.value)}
-                    placeholder="0.00"
-                    className="h-8 text-xs bg-white rounded-xl font-bold border-amber-300 shadow-2xs"
-                  />
-                </label>
-                <label className="space-y-1">
-                  <span className="text-[10px] font-semibold text-amber-900 block">Método adelanto (opc.)</span>
-                  <Select value={depositMethod} onValueChange={setDepositMethod}>
-                    <SelectTrigger className="h-8 text-xs bg-white rounded-xl border-amber-300 shadow-2xs">
-                      <SelectValue placeholder="Método..." />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {activePaymentMethods.map(m => (
-                        <SelectItem key={m} value={m}>{m}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </label>
+              <div className="flex items-center justify-between pt-1">
+                <span className="text-[11px] font-bold text-amber-950">Adelanto / Anticipo</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !isMixedDeposit;
+                    setIsMixedDeposit(next);
+                    if (next) {
+                      const cur = Number(deposit) || 0;
+                      if (cur > 0) {
+                        setMixedDepositCash((cur / 2).toFixed(2));
+                        setMixedDepositTransfer((cur / 2).toFixed(2));
+                      }
+                    } else {
+                      const mTotal = (Number(mixedDepositCash) || 0) + (Number(mixedDepositTransfer) || 0);
+                      setDeposit(String(mTotal > 0 ? mTotal : "0"));
+                    }
+                  }}
+                  className={`text-[10px] font-bold px-2 py-0.5 rounded-lg border transition-all ${
+                    isMixedDeposit
+                      ? "bg-amber-600 text-white border-amber-600 shadow-xs"
+                      : "bg-white text-amber-800 border-amber-300 hover:bg-amber-100"
+                  }`}
+                >
+                  {isMixedDeposit ? "✓ Pago mixto (Efec. + Transf.)" : "+ Dividir (pago mixto)"}
+                </button>
               </div>
+
+              {!isMixedDeposit ? (
+                <div className="grid grid-cols-2 gap-2 text-xs">
+                  <label className="space-y-1">
+                    <span className="text-[10px] font-semibold text-amber-900 block">Adelanto ({currencySymbol})</span>
+                    <Input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={deposit}
+                      onChange={(e) => setDeposit(e.target.value)}
+                      placeholder="0.00"
+                      className="h-8 text-xs bg-white rounded-xl font-bold border-amber-300 shadow-2xs"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-[10px] font-semibold text-amber-900 block">Método adelanto</span>
+                    <Select value={depositMethod} onValueChange={setDepositMethod}>
+                      <SelectTrigger className="h-8 text-xs bg-white rounded-xl border-amber-300 shadow-2xs">
+                        <SelectValue placeholder="Método..." />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {activePaymentMethods.map(m => (
+                          <SelectItem key={m} value={m}>{m}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </label>
+                </div>
+              ) : (
+                <div className="space-y-2 p-2 rounded-xl bg-amber-100/70 border border-amber-300 text-xs">
+                  <div className="grid grid-cols-2 gap-2">
+                    <label className="space-y-1">
+                      <span className="text-[10px] font-semibold text-amber-900 block">Efectivo ({currencySymbol})</span>
+                      <Input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={mixedDepositCash}
+                        onChange={(e) => setMixedDepositCash(e.target.value)}
+                        placeholder="0.00"
+                        className="h-8 text-xs bg-white rounded-xl font-bold border-amber-300 shadow-2xs"
+                      />
+                    </label>
+                    <label className="space-y-1">
+                      <span className="text-[10px] font-semibold text-amber-900 block">Transferencia ({currencySymbol})</span>
+                      <Input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={mixedDepositTransfer}
+                        onChange={(e) => setMixedDepositTransfer(e.target.value)}
+                        placeholder="0.00"
+                        className="h-8 text-xs bg-white rounded-xl font-bold border-amber-300 shadow-2xs"
+                      />
+                    </label>
+                  </div>
+                  <div className="flex justify-between items-center text-[11px] font-bold text-amber-950 px-1 pt-0.5 border-t border-amber-200">
+                    <span>Total adelanto mixto:</span>
+                    <span className="text-emerald-800 font-extrabold text-xs">
+                      {formatCurrency((Number(mixedDepositCash) || 0) + (Number(mixedDepositTransfer) || 0), currencySymbol)}
+                    </span>
+                  </div>
+                </div>
+              )}
 
               <label className="space-y-1 block text-xs">
                 <span className="text-[10px] font-semibold text-amber-900 block">Notas de la reserva</span>

@@ -59,7 +59,7 @@ export const saleDetailsTable = pgTable("sale_details", {
   saleId: integer("sale_id").notNull().references(() => salesTable.id, { onDelete: "cascade" }),
   productId: integer("product_id").references(() => productsTable.id, { onDelete: "set null" }),
   productName: varchar("product_name", { length: 300 }).notNull(),
-  quantity: integer("quantity").notNull(),
+  quantity: numeric("quantity", { precision: 12, scale: 2 }).notNull(),
   unitPrice: numeric("unit_price", { precision: 12, scale: 2 }).notNull(),
   subtotal: numeric("subtotal", { precision: 12, scale: 2 }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -72,7 +72,8 @@ export const reservationsTable = pgTable("reservations", {
   status: varchar("status", { length: 30 }).notNull().default("reserva"),
   total: numeric("total", { precision: 12, scale: 2 }).notNull(),
   deposit: numeric("deposit", { precision: 12, scale: 2 }).notNull().default("0"),
-  depositMethod: varchar("deposit_method", { length: 100 }),
+  depositMethod: varchar("deposit_method", { length: 255 }),
+  cashRegisterSessionId: integer("cash_register_session_id").references(() => cashRegisterSessionsTable.id, { onDelete: "set null" }),
   reservationDate: date("reservation_date").notNull().defaultNow(),
   expectedAt: date("expected_at"),
   notes: text("notes"),
@@ -81,13 +82,21 @@ export const reservationsTable = pgTable("reservations", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => new Date()),
 });
 
+export const reservationPaymentsTable = pgTable("reservation_payments", {
+  id: serial("id").primaryKey(),
+  reservationId: integer("reservation_id").notNull().references(() => reservationsTable.id, { onDelete: "cascade" }),
+  paymentMethod: varchar("payment_method", { length: 100 }).notNull(),
+  amount: numeric("amount", { precision: 12, scale: 2 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const reservationDetailsTable = pgTable("reservation_details", {
   id: serial("id").primaryKey(),
   reservationId: integer("reservation_id").notNull().references(() => reservationsTable.id, { onDelete: "cascade" }),
   productId: integer("product_id").references(() => productsTable.id, { onDelete: "set null" }),
   productName: varchar("product_name", { length: 300 }).notNull(),
   specifications: text("specifications").notNull(),
-  quantity: integer("quantity").notNull(),
+  quantity: numeric("quantity", { precision: 12, scale: 2 }).notNull(),
   unitPrice: numeric("unit_price", { precision: 12, scale: 2 }).notNull(),
   subtotal: numeric("subtotal", { precision: 12, scale: 2 }).notNull(),
   status: varchar("status", { length: 30 }).notNull().default("reserva"),
@@ -103,6 +112,7 @@ export type Sale = typeof salesTable.$inferSelect;
 export type SaleDetail = typeof saleDetailsTable.$inferSelect;
 export type SalePayment = typeof salePaymentsTable.$inferSelect;
 export type Reservation = typeof reservationsTable.$inferSelect;
+export type ReservationPayment = typeof reservationPaymentsTable.$inferSelect;
 export type ReservationDetail = typeof reservationDetailsTable.$inferSelect;
 export type CashRegisterSession = typeof cashRegisterSessionsTable.$inferSelect;
 export type CashRegisterExpense = typeof cashRegisterExpensesTable.$inferSelect;

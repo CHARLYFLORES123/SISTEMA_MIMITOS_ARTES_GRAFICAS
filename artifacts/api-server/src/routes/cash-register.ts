@@ -1,9 +1,12 @@
 import { Router } from "express";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import {
   cashRegisterExpensesTable,
   cashRegisterSessionsTable,
+  customersTable,
   db,
+  reservationPaymentsTable,
+  reservationsTable,
   salePaymentsTable,
   salesTable,
   usersTable,
@@ -66,6 +69,70 @@ async function getSessionSummary(sessionId: number) {
       totalsByMethod.set(payment.paymentMethod, (totalsByMethod.get(payment.paymentMethod) ?? 0) + payment.amount);
     }
   }
+
+  // Reservation deposits registered in this cash session
+  // Auto-link any unassigned deposits created on this business date that haven't been linked
+  await db
+    .update(reservationsTable)
+    .set({ cashRegisterSessionId: sessionId })
+    .where(and(
+      sql`${reservationsTable.cashRegisterSessionId} IS NULL`,
+      sql`CAST(${reservationsTable.deposit} AS NUMERIC) > 0`,
+      or(
+        eq(reservationsTable.userId, session.session.userId),
+        sql`${reservationsTable.userId} IS NULL`
+      ),
+      sql`CAST(${reservationsTable.reservationDate} AS text) = ${session.session.businessDate}`
+    ));
+
+  const reservations = await db
+    .select({
+      id: reservationsTable.id,
+      total: reservationsTable.total,
+      deposit: reservationsTable.deposit,
+      depositMethod: reservationsTable.depositMethod,
+      createdAt: reservationsTable.createdAt,
+      customerId: reservationsTable.customerId,
+      customerName: customersTable.name,
+      userId: reservationsTable.userId,
+      userName: usersTable.name,
+    })
+    .from(reservationsTable)
+    .leftJoin(customersTable, eq(reservationsTable.customerId, customersTable.id))
+    .leftJoin(usersTable, eq(reservationsTable.userId, usersTable.id))
+    .where(and(
+      sql`CAST(${reservationsTable.deposit} AS NUMERIC) > 0`,
+      or(
+        eq(reservationsTable.cashRegisterSessionId, sessionId),
+        and(
+          sql`${reservationsTable.cashRegisterSessionId} IS NULL`,
+          sql`CAST(${reservationsTable.reservationDate} AS text) = ${session.session.businessDate}`
+        )
+      )
+    ))
+    .orderBy(reservationsTable.id);
+
+  const resvPayments = reservations.length
+    ? await db.select().from(reservationPaymentsTable).where(inArray(reservationPaymentsTable.reservationId, reservations.map(r => r.id)))
+    : [];
+
+  const paymentsByReservation = new Map<number, typeof resvPayments>();
+  for (const p of resvPayments) {
+    const list = paymentsByReservation.get(p.reservationId) ?? [];
+    list.push(p);
+    paymentsByReservation.set(p.reservationId, list);
+  }
+
+  for (const resv of reservations) {
+    const pList = paymentsByReservation.get(resv.id);
+    const effectivePayments = pList?.length
+      ? pList.map(({ paymentMethod, amount }) => ({ paymentMethod, amount: Number(amount) }))
+      : [{ paymentMethod: resv.depositMethod || "Efectivo", amount: Number(resv.deposit) }];
+    for (const payment of effectivePayments) {
+      totalsByMethod.set(payment.paymentMethod, (totalsByMethod.get(payment.paymentMethod) ?? 0) + payment.amount);
+    }
+  }
+
   const expenses = await db
     .select({
       id: cashRegisterExpensesTable.id,
@@ -77,11 +144,40 @@ async function getSessionSummary(sessionId: number) {
     .from(cashRegisterExpensesTable)
     .innerJoin(usersTable, eq(cashRegisterExpensesTable.authorizedBy, usersTable.id))
     .where(eq(cashRegisterExpensesTable.sessionId, sessionId));
-  const cashSales = roundMoney([...totalsByMethod.entries()]
-    .filter(([method]) => method.toLowerCase().includes("efectivo"))
-    .reduce((sum, [, amount]) => sum + amount, 0));
+
+  // Compute cash from sales
+  let cashSales = 0;
+  for (const sale of sales) {
+    const salePayments = paymentsBySale.get(sale.id);
+    const effective = salePayments?.length
+      ? salePayments.map(p => ({ paymentMethod: p.paymentMethod, amount: Number(p.amount) }))
+      : [{ paymentMethod: sale.paymentMethod, amount: Number(sale.total) }];
+    cashSales += effective
+      .filter(({ paymentMethod }) => paymentMethod.toLowerCase().includes("efectivo"))
+      .reduce((sum, p) => sum + p.amount, 0);
+  }
+  cashSales = roundMoney(cashSales);
+
+  // Compute cash from deposits & total deposits
+  let cashDeposits = 0;
+  let totalDeposits = 0;
+  for (const resv of reservations) {
+    const pList = paymentsByReservation.get(resv.id);
+    const effective = pList?.length
+      ? pList.map(({ paymentMethod, amount }) => ({ paymentMethod, amount: Number(amount) }))
+      : [{ paymentMethod: resv.depositMethod || "Efectivo", amount: Number(resv.deposit) }];
+    for (const p of effective) {
+      totalDeposits += p.amount;
+      if (p.paymentMethod.toLowerCase().includes("efectivo")) {
+        cashDeposits += p.amount;
+      }
+    }
+  }
+  cashDeposits = roundMoney(cashDeposits);
+  totalDeposits = roundMoney(totalDeposits);
+
   const totalExpenses = roundMoney(expenses.reduce((sum, expense) => sum + Number(expense.amount), 0));
-  const expectedCash = roundMoney(Number(session.session.openingAmount) + cashSales - totalExpenses);
+  const expectedCash = roundMoney(Number(session.session.openingAmount) + cashSales + cashDeposits - totalExpenses);
 
   return {
     id: session.session.id,
@@ -91,6 +187,24 @@ async function getSessionSummary(sessionId: number) {
     status: session.session.status,
     openingAmount: Number(session.session.openingAmount),
     cashSales,
+    cashDeposits,
+    totalDeposits,
+    deposits: reservations.map((resv) => {
+      const pList = paymentsByReservation.get(resv.id);
+      const effectivePayments = pList?.length
+        ? pList.map(({ paymentMethod, amount }) => ({ paymentMethod, amount: Number(amount) }))
+        : [{ paymentMethod: resv.depositMethod || "Efectivo", amount: Number(resv.deposit) }];
+      return {
+        id: resv.id,
+        customerName: resv.customerName || "Sin cliente",
+        userName: resv.userName || "—",
+        total: Number(resv.total),
+        deposit: Number(resv.deposit),
+        depositMethod: resv.depositMethod,
+        createdAt: resv.createdAt.toISOString(),
+        payments: effectivePayments,
+      };
+    }),
     totalsByMethod: Object.fromEntries([...totalsByMethod].map(([method, amount]) => [method, roundMoney(amount)])),
     expenses: expenses.map((expense) => ({
       id: expense.id,
@@ -117,13 +231,24 @@ router.get("/", async (req: AuthRequest, res) => {
     return;
   }
   try {
-    const [session] = await db.select({ id: cashRegisterSessionsTable.id })
+    const queryUserId = (req.userRole === "admin" && req.query.userId) ? Number(req.query.userId) : req.userId!;
+    let [session] = await db.select({ id: cashRegisterSessionsTable.id })
       .from(cashRegisterSessionsTable)
       .where(and(
-        eq(cashRegisterSessionsTable.userId, req.userId!),
+        eq(cashRegisterSessionsTable.userId, queryUserId),
         eq(cashRegisterSessionsTable.businessDate, date),
       ))
       .limit(1);
+
+    // If admin and no session for user, check if there's any session registered for this date
+    if (!session && req.userRole === "admin") {
+      [session] = await db.select({ id: cashRegisterSessionsTable.id })
+        .from(cashRegisterSessionsTable)
+        .where(eq(cashRegisterSessionsTable.businessDate, date))
+        .orderBy(sql`${cashRegisterSessionsTable.id} DESC`)
+        .limit(1);
+    }
+
     if (!session) {
       res.json(null);
       return;
@@ -162,7 +287,7 @@ router.post("/open", async (req: AuthRequest, res) => {
   }
 });
 
-router.post("/:id/expenses", requireRoles(["admin", "inventario"]), async (req: AuthRequest, res) => {
+router.post("/:id/expenses", requireRoles(["admin", "inventario", "vendedor"]), async (req: AuthRequest, res) => {
   const sessionId = Number(req.params.id);
   const { description, amount } = req.body as { description?: unknown; amount?: unknown };
   if (!Number.isSafeInteger(sessionId) || sessionId <= 0 ||
@@ -246,9 +371,34 @@ router.post("/:id/close", async (req: AuthRequest, res) => {
       const expenses = await tx.select({ amount: cashRegisterExpensesTable.amount })
         .from(cashRegisterExpensesTable)
         .where(eq(cashRegisterExpensesTable.sessionId, sessionId));
+
+      const reservations = await tx.select({
+        id: reservationsTable.id,
+        deposit: reservationsTable.deposit,
+        depositMethod: reservationsTable.depositMethod,
+      }).from(reservationsTable).where(and(
+        eq(reservationsTable.cashRegisterSessionId, sessionId),
+        sql`CAST(${reservationsTable.deposit} AS NUMERIC) > 0`,
+      ));
+      const resvPayments = reservations.length
+        ? await tx.select().from(reservationPaymentsTable).where(inArray(reservationPaymentsTable.reservationId, reservations.map(r => r.id)))
+        : [];
+      let cashDeposits = 0;
+      for (const resv of reservations) {
+        const pList = resvPayments.filter(p => p.reservationId === resv.id);
+        const effectivePayments = pList.length
+          ? pList.map(p => ({ paymentMethod: p.paymentMethod, amount: Number(p.amount) }))
+          : [{ paymentMethod: resv.depositMethod || "Efectivo", amount: Number(resv.deposit) }];
+        cashDeposits += effectivePayments
+          .filter(p => p.paymentMethod.toLowerCase().includes("efectivo"))
+          .reduce((sum, p) => sum + p.amount, 0);
+      }
+      cashDeposits = roundMoney(cashDeposits);
+
       const expectedCash = roundMoney(
         Number(session.openingAmount) +
-        cashSales -
+        cashSales +
+        cashDeposits -
         expenses.reduce((sum, expense) => sum + Number(expense.amount), 0),
       );
       const counted = roundMoney(countedCash);

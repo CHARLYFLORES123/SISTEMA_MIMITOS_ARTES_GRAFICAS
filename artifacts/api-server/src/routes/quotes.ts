@@ -147,7 +147,7 @@ router.post("/:id/convert", canWrite, async (req: AuthRequest, res) => {
       for (const d of details) {
         await tx.insert(saleDetailsTable).values({
           saleId: newSale.id, productId: d.productId, productName: d.productName,
-          quantity: d.quantity, unitPrice: d.unitPrice, subtotal: d.subtotal,
+          quantity: String(d.quantity), unitPrice: d.unitPrice, subtotal: d.subtotal,
         });
         if (d.productId) {
           const p = productMap.get(d.productId);

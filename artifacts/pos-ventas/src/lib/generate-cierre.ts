@@ -1,4 +1,4 @@
-interface CierreSale {
+export interface CierreSale {
   id: number;
   customerName?: string | null;
   userName?: string | null;
@@ -11,13 +11,23 @@ interface CierreSale {
   createdAt: string;
 }
 
-interface PaymentGroup {
+export interface CierreDeposit {
+  id: number;
+  customerName: string;
+  total: number;
+  deposit: number;
+  depositMethod: string | null;
+  createdAt: string;
+  payments: Array<{ paymentMethod: string; amount: number }>;
+}
+
+export interface PaymentGroup {
   method: string;
   count: number;
   total: number;
 }
 
-interface CierreData {
+export interface CierreData {
   date: string;
   sales: CierreSale[];
   groups: PaymentGroup[];
@@ -26,6 +36,9 @@ interface CierreData {
   totalSubtotal: number;
   countCompleted: number;
   countCancelled: number;
+  deposits?: CierreDeposit[];
+  totalDeposits?: number;
+  grandTotal?: number;
 }
 
 interface BusinessSettings {
@@ -78,7 +91,7 @@ function fmtDateLong(dateStr: string): string {
   }
 }
 
-export function computeCierreData(sales: CierreSale[], date: string): CierreData {
+export function computeCierreData(sales: CierreSale[], date: string, deposits?: CierreDeposit[]): CierreData {
   const completed = sales.filter((s) => s.status === "completada");
   const cancelled = sales.filter((s) => s.status !== "completada");
 
@@ -98,9 +111,29 @@ export function computeCierreData(sales: CierreSale[], date: string): CierreData
     }
   }
 
+  // Include reservation deposits in method groups
+  if (deposits && deposits.length > 0) {
+    for (const dep of deposits) {
+      const payments = dep.payments?.length
+        ? dep.payments
+        : [{ paymentMethod: dep.depositMethod || "Efectivo", amount: dep.deposit }];
+      for (const payment of payments) {
+        const existing = groupMap.get(payment.paymentMethod);
+        if (existing) {
+          existing.count++;
+          existing.total += payment.amount;
+        } else {
+          groupMap.set(payment.paymentMethod, { method: payment.paymentMethod, count: 1, total: payment.amount });
+        }
+      }
+    }
+  }
+
   const totalCompleted = completed.reduce((sum, s) => sum + s.total, 0);
   const totalSubtotal = completed.reduce((sum, s) => sum + s.subtotal, 0);
   const totalIva = completed.reduce((sum, s) => sum + s.iva, 0);
+  const totalDeposits = (deposits || []).reduce((sum, d) => sum + d.deposit, 0);
+  const grandTotal = totalCompleted + totalDeposits;
 
   return {
     date,
@@ -111,6 +144,9 @@ export function computeCierreData(sales: CierreSale[], date: string): CierreData
     totalIva,
     countCompleted: completed.length,
     countCancelled: cancelled.length,
+    deposits: deposits ?? [],
+    totalDeposits,
+    grandTotal,
   };
 }
 
@@ -144,6 +180,23 @@ export function buildCierreHTML(
       <td>${escHtml(s.customerName || "Consumidor Final")}</td>
       <td>${escHtml(s.paymentMethod)}</td>
       <td class="num ${completed ? "bold" : "cancelled-text"}">${completed ? `${sym} ${s.total.toFixed(2)}` : "ANULADA"}</td>
+    </tr>`;
+    })
+    .join("");
+
+  const depositRows = (data.deposits || [])
+    .map((d) => {
+      const breakdown = d.payments?.length > 1
+        ? d.payments.map((p) => `${p.paymentMethod}: ${sym} ${p.amount.toFixed(2)}`).join(" / ")
+        : (d.payments?.[0]?.paymentMethod ? `${d.payments[0].paymentMethod}: ${sym} ${d.payments[0].amount.toFixed(2)}` : (d.depositMethod || "Efectivo"));
+      return `
+    <tr>
+      <td class="mono">#${String(d.id).padStart(6, "0")}</td>
+      <td>${escHtml(fmtDate(d.createdAt))}</td>
+      <td>${escHtml(d.customerName)}</td>
+      <td><span style="font-weight:600;color:#92400e;">${escHtml(breakdown)}</span></td>
+      <td class="num">${sym} ${d.total.toFixed(2)}</td>
+      <td class="num bold" style="color:#047857;">+${sym} ${d.deposit.toFixed(2)}</td>
     </tr>`;
     })
     .join("");
@@ -365,13 +418,13 @@ export function buildCierreHTML(
   <div class="cards">
     <div class="card green">
       <div class="c-label">Total Recaudado</div>
-      <div class="c-value">${sym} ${data.totalCompleted.toFixed(2)}</div>
-      <div class="c-sub">ventas completadas</div>
+      <div class="c-value">${sym} ${(data.grandTotal ?? data.totalCompleted).toFixed(2)}</div>
+      <div class="c-sub">${data.totalDeposits && data.totalDeposits > 0 ? `ventas (${sym} ${data.totalCompleted.toFixed(2)}) + adelantos (${sym} ${data.totalDeposits.toFixed(2)})` : "ventas completadas"}</div>
     </div>
     <div class="card indigo">
       <div class="c-label">Transacciones</div>
-      <div class="c-value">${data.countCompleted}</div>
-      <div class="c-sub">completadas</div>
+      <div class="c-value">${data.countCompleted + (data.deposits?.length || 0)}</div>
+      <div class="c-sub">${data.deposits && data.deposits.length > 0 ? `${data.countCompleted} ventas · ${data.deposits.length} adelanto(s)` : "completadas"}</div>
     </div>
     <div class="card amber">
       <div class="c-label">Promedio / Venta</div>
@@ -397,13 +450,13 @@ export function buildCierreHTML(
       </tr>
     </thead>
     <tbody>
-      ${groupRows || '<tr><td colspan="4" style="text-align:center;color:#9ca3af;">Sin ventas</td></tr>'}
+      ${groupRows || '<tr><td colspan="4" style="text-align:center;color:#9ca3af;">Sin transacciones</td></tr>'}
     </tbody>
     <tfoot>
       <tr>
-        <td style="font-weight:bold">TOTAL</td>
-        <td class="num">${data.countCompleted}</td>
-        <td class="num">${sym} ${data.totalCompleted.toFixed(2)}</td>
+        <td style="font-weight:bold">TOTAL RECAUDADO</td>
+        <td class="num">${data.countCompleted + (data.deposits?.length || 0)}</td>
+        <td class="num">${sym} ${(data.grandTotal ?? data.totalCompleted).toFixed(2)}</td>
         <td class="num">100%</td>
       </tr>
     </tfoot>
@@ -413,15 +466,46 @@ export function buildCierreHTML(
   <div class="totals-block">
     <div class="totals-inner">
       <div class="tot-row">
-        <span class="lbl">Subtotal:</span>
-        <span>${sym} ${data.totalSubtotal.toFixed(2)}</span>
-      </div>
-      <div class="tot-row grand">
-        <span>TOTAL:</span>
+        <span class="lbl">Ventas completadas:</span>
         <span>${sym} ${data.totalCompleted.toFixed(2)}</span>
+      </div>
+      ${data.totalDeposits && data.totalDeposits > 0 ? `
+      <div class="tot-row">
+        <span class="lbl">Adelantos reservas:</span>
+        <span style="color:#047857;font-weight:bold;">+${sym} ${data.totalDeposits.toFixed(2)}</span>
+      </div>` : ""}
+      <div class="tot-row grand">
+        <span>TOTAL RECAUDADO:</span>
+        <span>${sym} ${(data.grandTotal ?? data.totalCompleted).toFixed(2)}</span>
       </div>
     </div>
   </div>
+
+  ${(data.deposits && data.deposits.length > 0) ? `
+  <!-- RESERVATION DEPOSITS -->
+  <div class="section-title">Adelantos de Reservas Recibidos</div>
+  <table>
+    <thead>
+      <tr>
+        <th>N° Reserva</th>
+        <th>Hora</th>
+        <th>Cliente</th>
+        <th>Método / Desglose</th>
+        <th class="num">Total Reserva</th>
+        <th class="num">Adelanto</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${depositRows}
+    </tbody>
+    <tfoot>
+      <tr>
+        <td colspan="5" style="font-weight:bold">TOTAL ADELANTOS RECIBIDOS</td>
+        <td class="num">${sym} ${data.totalDeposits?.toFixed(2) ?? "0.00"}</td>
+      </tr>
+    </tfoot>
+  </table>
+  ` : ""}
 
   <!-- TRANSACTION LIST -->
   <div class="section-title">Detalle de Transacciones</div>
