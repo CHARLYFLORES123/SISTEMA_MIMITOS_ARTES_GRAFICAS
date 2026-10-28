@@ -1,19 +1,31 @@
 export interface CierreSale {
   id: number;
+  customerId?: number | null;
   customerName?: string | null;
   userName?: string | null;
   total: number;
   subtotal: number;
+  discount?: number;
   iva: number;
   paymentMethod: string;
   payments?: Array<{ paymentMethod: string; amount: number }>;
+  amountPaid?: number | null;
+  changeDue?: number | null;
   status: string;
+  notes?: string | null;
   createdAt: string;
+  isReservationDelivery?: boolean;
+  reservationId?: number | null;
+  reservationDeposit?: number | null;
+  reservationDepositMethod?: string | null;
+  reservationDepositPayments?: Array<{ paymentMethod: string; amount: number }>;
+  reservationBalance?: number | null;
 }
 
 export interface CierreDeposit {
   id: number;
   customerName: string;
+  userName?: string;
   total: number;
   deposit: number;
   depositMethod: string | null;
@@ -31,14 +43,19 @@ export interface CierreData {
   date: string;
   sales: CierreSale[];
   groups: PaymentGroup[];
-  totalCompleted: number;
+  totalCompleted: number; // Grand total / total recaudado
+  totalDirectSales: number; // Total de ventas directas
+  totalReservationBalances: number; // Saldo a cobrar / cobrado de reservas entregadas
+  totalDeposits: number; // Adelantos de reservas (de reservas entregadas + nuevos adelantos del día)
+  grandTotal: number; // Total recaudado = totalDirectSales + totalReservationBalances + totalDeposits
   totalIva: number;
   totalSubtotal: number;
-  countCompleted: number;
+  countCompleted: number; // Total operaciones completadas
+  countDirectSales: number;
+  countReservationDeliveries: number;
+  countNewDeposits: number;
   countCancelled: number;
-  deposits?: CierreDeposit[];
-  totalDeposits?: number;
-  grandTotal?: number;
+  deposits: CierreDeposit[];
 }
 
 interface BusinessSettings {
@@ -95,58 +112,177 @@ export function computeCierreData(sales: CierreSale[], date: string, deposits?: 
   const completed = sales.filter((s) => s.status === "completada");
   const cancelled = sales.filter((s) => s.status !== "completada");
 
-  const groupMap = new Map<string, PaymentGroup>();
+  const deliveredReservations: Array<{
+    saleId: number;
+    reservationId?: number | null;
+    deposit: number;
+    depositMethod?: string | null;
+    depositPayments: Array<{ paymentMethod: string; amount: number }>;
+    balance: number;
+    balancePayments: Array<{ paymentMethod: string; amount: number }>;
+    total: number;
+  }> = [];
+
+  let totalDirectSales = 0;
+  let totalReservationBalances = 0;
+  let countDirectSales = 0;
+  let countReservationDeliveries = 0;
+
+  const deliveredResvIds = new Set<number>();
+
   for (const s of completed) {
-    const payments = s.payments?.length
-      ? s.payments
-      : [{ paymentMethod: s.paymentMethod, amount: s.total }];
-    for (const payment of payments) {
-      const existing = groupMap.get(payment.paymentMethod);
-      if (existing) {
-        existing.count++;
-        existing.total += payment.amount;
-      } else {
-        groupMap.set(payment.paymentMethod, { method: payment.paymentMethod, count: 1, total: payment.amount });
+    const isResv = Boolean(
+      s.isReservationDelivery ||
+      s.reservationId ||
+      (s.notes && s.notes.includes("Entrega de reserva #"))
+    );
+
+    if (isResv) {
+      countReservationDeliveries++;
+      let resvId = s.reservationId ?? null;
+      let deposit = s.reservationDeposit ?? null;
+      if (!resvId && s.notes) {
+        const m = s.notes.match(/Entrega de reserva #(\d+)/);
+        if (m) resvId = Number(m[1]);
       }
+      if (deposit === null && s.notes) {
+        const m = s.notes.match(/Adelanto recibido previamente:\s*([0-9.]+)/);
+        if (m) deposit = Number(m[1]);
+      }
+      const depAmount = Math.max(0, deposit ?? 0);
+      if (resvId) deliveredResvIds.add(resvId);
+
+      const balance = Number(
+        s.reservationBalance != null
+          ? s.reservationBalance
+          : s.amountPaid != null
+          ? s.amountPaid
+          : Math.max(0, s.total - depAmount)
+      );
+
+      totalReservationBalances += balance;
+
+      // Payments for the saldo a cobrar
+      const balancePayments = s.payments?.length
+        ? s.payments
+        : (balance > 0 ? [{ paymentMethod: s.paymentMethod || "Efectivo", amount: balance }] : []);
+
+      // Payments for the adelanto
+      const depositPayments = s.reservationDepositPayments?.length
+        ? s.reservationDepositPayments
+        : (depAmount > 0 ? [{ paymentMethod: s.reservationDepositMethod || "Efectivo", amount: depAmount }] : []);
+
+      deliveredReservations.push({
+        saleId: s.id,
+        reservationId: resvId,
+        deposit: depAmount,
+        depositMethod: s.reservationDepositMethod,
+        depositPayments,
+        balance,
+        balancePayments,
+        total: s.total,
+      });
+    } else {
+      countDirectSales++;
+      totalDirectSales += s.total;
     }
   }
 
-  // Include reservation deposits in method groups
+  // Active (not delivered today) deposits from the register session deposits list
+  const pendingDepositsList: CierreDeposit[] = [];
+  let pendingDepositsAmount = 0;
   if (deposits && deposits.length > 0) {
     for (const dep of deposits) {
-      const payments = dep.payments?.length
-        ? dep.payments
-        : [{ paymentMethod: dep.depositMethod || "Efectivo", amount: dep.deposit }];
-      for (const payment of payments) {
-        const existing = groupMap.get(payment.paymentMethod);
-        if (existing) {
-          existing.count++;
-          existing.total += payment.amount;
-        } else {
-          groupMap.set(payment.paymentMethod, { method: payment.paymentMethod, count: 1, total: payment.amount });
-        }
+      if (!deliveredResvIds.has(dep.id)) {
+        pendingDepositsList.push(dep);
+        pendingDepositsAmount += dep.deposit;
       }
     }
   }
 
-  const totalCompleted = completed.reduce((sum, s) => sum + s.total, 0);
+  const deliveredDepositsAmount = deliveredReservations.reduce((acc, dr) => acc + dr.deposit, 0);
+  const totalDeposits = Math.round((deliveredDepositsAmount + pendingDepositsAmount + Number.EPSILON) * 100) / 100;
+  totalDirectSales = Math.round((totalDirectSales + Number.EPSILON) * 100) / 100;
+  totalReservationBalances = Math.round((totalReservationBalances + Number.EPSILON) * 100) / 100;
+  const grandTotal = Math.round((totalDirectSales + totalReservationBalances + totalDeposits + Number.EPSILON) * 100) / 100;
+
+  // Build Payment Groups (By Payment Method)
+  const groupMap = new Map<string, PaymentGroup>();
+
+  const addPayment = (rawMethod: string, amount: number) => {
+    if (!amount || amount <= 0) return;
+    const method = rawMethod?.trim() || "Efectivo";
+    const existing = groupMap.get(method);
+    if (existing) {
+      existing.count++;
+      existing.total = Math.round((existing.total + amount + Number.EPSILON) * 100) / 100;
+    } else {
+      groupMap.set(method, {
+        method,
+        count: 1,
+        total: Math.round((amount + Number.EPSILON) * 100) / 100,
+      });
+    }
+  };
+
+  // 1. Direct Sales payments
+  for (const s of completed) {
+    const isResv = Boolean(
+      s.isReservationDelivery ||
+      s.reservationId ||
+      (s.notes && s.notes.includes("Entrega de reserva #"))
+    );
+    if (!isResv) {
+      const payments = s.payments?.length
+        ? s.payments
+        : [{ paymentMethod: s.paymentMethod || "Efectivo", amount: s.total }];
+      for (const p of payments) {
+        addPayment(p.paymentMethod, p.amount);
+      }
+    }
+  }
+
+  // 2. Delivered Reservations: both Saldo a cobrar AND Adelanto
+  for (const dr of deliveredReservations) {
+    for (const p of dr.balancePayments) {
+      addPayment(p.paymentMethod, p.amount);
+    }
+    for (const p of dr.depositPayments) {
+      addPayment(p.paymentMethod, p.amount);
+    }
+  }
+
+  // 3. New pending reservation deposits
+  for (const dep of pendingDepositsList) {
+    const payments = dep.payments?.length
+      ? dep.payments
+      : [{ paymentMethod: dep.depositMethod || "Efectivo", amount: dep.deposit }];
+    for (const p of payments) {
+      addPayment(p.paymentMethod, p.amount);
+    }
+  }
+
   const totalSubtotal = completed.reduce((sum, s) => sum + s.subtotal, 0);
   const totalIva = completed.reduce((sum, s) => sum + s.iva, 0);
-  const totalDeposits = (deposits || []).reduce((sum, d) => sum + d.deposit, 0);
-  const grandTotal = totalCompleted + totalDeposits;
+  const countNewDeposits = pendingDepositsList.length;
 
   return {
     date,
     sales,
     groups: Array.from(groupMap.values()).sort((a, b) => b.total - a.total),
-    totalCompleted,
-    totalSubtotal,
-    totalIva,
-    countCompleted: completed.length,
-    countCancelled: cancelled.length,
-    deposits: deposits ?? [],
+    totalCompleted: grandTotal,
+    totalDirectSales,
+    totalReservationBalances,
     totalDeposits,
     grandTotal,
+    totalSubtotal,
+    totalIva,
+    countCompleted: countDirectSales + countReservationDeliveries + countNewDeposits,
+    countDirectSales,
+    countReservationDeliveries,
+    countNewDeposits,
+    countCancelled: cancelled.length,
+    deposits: deposits ?? [],
   };
 }
 
@@ -165,7 +301,7 @@ export function buildCierreHTML(
       <td>${escHtml(g.method)}</td>
       <td class="num">${g.count}</td>
       <td class="num bold">${sym} ${g.total.toFixed(2)}</td>
-      <td class="num">${data.totalCompleted > 0 ? ((g.total / data.totalCompleted) * 100).toFixed(1) : "0.0"}%</td>
+      <td class="num">${data.grandTotal > 0 ? ((g.total / data.grandTotal) * 100).toFixed(1) : "0.0"}%</td>
     </tr>`
     )
     .join("");
@@ -173,13 +309,28 @@ export function buildCierreHTML(
   const saleRows = data.sales
     .map((s) => {
       const completed = s.status === "completada";
+      const isResv = Boolean(
+        s.isReservationDelivery ||
+        s.reservationId ||
+        (s.notes && s.notes.includes("Entrega de reserva #"))
+      );
+      const docLabel = isResv
+        ? `#${String(s.id).padStart(6, "0")} (Reserva #${s.reservationId || "—"})`
+        : `#${String(s.id).padStart(6, "0")}`;
+      const amountLabel = completed
+        ? isResv
+          ? `${sym} ${(s.reservationBalance ?? s.total).toFixed(2)} <span style="font-size:9px;color:#64748b;">(Tot: ${sym} ${s.total.toFixed(2)})</span>`
+          : `${sym} ${s.total.toFixed(2)}`
+        : "ANULADA";
+
       return `
     <tr class="${completed ? "" : "cancelled-row"}">
-      <td class="mono">#${String(s.id).padStart(6, "0")}</td>
+      <td class="mono">${escHtml(docLabel)}</td>
       <td>${escHtml(fmtDate(s.createdAt))}</td>
       <td>${escHtml(s.customerName || "Consumidor Final")}</td>
-      <td>${escHtml(s.paymentMethod)}</td>
-      <td class="num ${completed ? "bold" : "cancelled-text"}">${completed ? `${sym} ${s.total.toFixed(2)}` : "ANULADA"}</td>
+      <td>${escHtml(s.userName || "—")}</td>
+      <td>${escHtml(s.paymentMethod)}${isResv ? ' <span style="color:#047857;font-weight:600;">[Entrega]</span>' : ''}</td>
+      <td class="num ${completed ? "bold" : "cancelled-text"}">${amountLabel}</td>
     </tr>`;
     })
     .join("");
@@ -194,6 +345,7 @@ export function buildCierreHTML(
       <td class="mono">#${String(d.id).padStart(6, "0")}</td>
       <td>${escHtml(fmtDate(d.createdAt))}</td>
       <td>${escHtml(d.customerName)}</td>
+      <td>${escHtml(d.userName || "—")}</td>
       <td><span style="font-weight:600;color:#92400e;">${escHtml(breakdown)}</span></td>
       <td class="num">${sym} ${d.total.toFixed(2)}</td>
       <td class="num bold" style="color:#047857;">+${sym} ${d.deposit.toFixed(2)}</td>
@@ -418,18 +570,18 @@ export function buildCierreHTML(
   <div class="cards">
     <div class="card green">
       <div class="c-label">Total Recaudado</div>
-      <div class="c-value">${sym} ${(data.grandTotal ?? data.totalCompleted).toFixed(2)}</div>
-      <div class="c-sub">${data.totalDeposits && data.totalDeposits > 0 ? `ventas (${sym} ${data.totalCompleted.toFixed(2)}) + adelantos (${sym} ${data.totalDeposits.toFixed(2)})` : "ventas completadas"}</div>
+      <div class="c-value">${sym} ${data.grandTotal.toFixed(2)}</div>
+      <div class="c-sub">ventas (${sym} ${data.totalDirectSales.toFixed(2)}) + adelantos (${sym} ${data.totalDeposits.toFixed(2)}) + saldo reservas (${sym} ${data.totalReservationBalances.toFixed(2)})</div>
     </div>
     <div class="card indigo">
       <div class="c-label">Transacciones</div>
-      <div class="c-value">${data.countCompleted + (data.deposits?.length || 0)}</div>
-      <div class="c-sub">${data.deposits && data.deposits.length > 0 ? `${data.countCompleted} ventas · ${data.deposits.length} adelanto(s)` : "completadas"}</div>
+      <div class="c-value">${data.countCompleted}</div>
+      <div class="c-sub">${data.countDirectSales} ventas · ${data.countReservationDeliveries} entregas · ${data.countNewDeposits} adelantos</div>
     </div>
     <div class="card amber">
-      <div class="c-label">Promedio / Venta</div>
-      <div class="c-value">${sym} ${data.countCompleted > 0 ? (data.totalCompleted / data.countCompleted).toFixed(2) : "0.00"}</div>
-      <div class="c-sub">por transacción</div>
+      <div class="c-label">Promedio / Operación</div>
+      <div class="c-value">${sym} ${data.countCompleted > 0 ? (data.grandTotal / data.countCompleted).toFixed(2) : "0.00"}</div>
+      <div class="c-sub">por operación completada</div>
     </div>
     <div class="card red">
       <div class="c-label">Anuladas</div>
@@ -455,8 +607,8 @@ export function buildCierreHTML(
     <tfoot>
       <tr>
         <td style="font-weight:bold">TOTAL RECAUDADO</td>
-        <td class="num">${data.countCompleted + (data.deposits?.length || 0)}</td>
-        <td class="num">${sym} ${(data.grandTotal ?? data.totalCompleted).toFixed(2)}</td>
+        <td class="num">${data.countCompleted}</td>
+        <td class="num">${sym} ${data.grandTotal.toFixed(2)}</td>
         <td class="num">100%</td>
       </tr>
     </tfoot>
@@ -466,17 +618,20 @@ export function buildCierreHTML(
   <div class="totals-block">
     <div class="totals-inner">
       <div class="tot-row">
-        <span class="lbl">Ventas completadas:</span>
-        <span>${sym} ${data.totalCompleted.toFixed(2)}</span>
+        <span class="lbl">Ventas directas:</span>
+        <span>${sym} ${data.totalDirectSales.toFixed(2)}</span>
       </div>
-      ${data.totalDeposits && data.totalDeposits > 0 ? `
       <div class="tot-row">
-        <span class="lbl">Adelantos reservas:</span>
-        <span style="color:#047857;font-weight:bold;">+${sym} ${data.totalDeposits.toFixed(2)}</span>
-      </div>` : ""}
+        <span class="lbl">Adelantos de reservas:</span>
+        <span style="color:#b45309;font-weight:bold;">+${sym} ${data.totalDeposits.toFixed(2)}</span>
+      </div>
+      <div class="tot-row">
+        <span class="lbl">Saldo a cobrar de reservas:</span>
+        <span style="color:#047857;font-weight:bold;">+${sym} ${data.totalReservationBalances.toFixed(2)}</span>
+      </div>
       <div class="tot-row grand">
         <span>TOTAL RECAUDADO:</span>
-        <span>${sym} ${(data.grandTotal ?? data.totalCompleted).toFixed(2)}</span>
+        <span>${sym} ${data.grandTotal.toFixed(2)}</span>
       </div>
     </div>
   </div>
@@ -490,6 +645,7 @@ export function buildCierreHTML(
         <th>N° Reserva</th>
         <th>Hora</th>
         <th>Cliente</th>
+        <th>Vendedor</th>
         <th>Método / Desglose</th>
         <th class="num">Total Reserva</th>
         <th class="num">Adelanto</th>
@@ -500,7 +656,7 @@ export function buildCierreHTML(
     </tbody>
     <tfoot>
       <tr>
-        <td colspan="5" style="font-weight:bold">TOTAL ADELANTOS RECIBIDOS</td>
+        <td colspan="6" style="font-weight:bold">TOTAL ADELANTOS RECIBIDOS</td>
         <td class="num">${sym} ${data.totalDeposits?.toFixed(2) ?? "0.00"}</td>
       </tr>
     </tfoot>
@@ -515,12 +671,13 @@ export function buildCierreHTML(
         <th>N° Boleta</th>
         <th>Hora</th>
         <th>Cliente</th>
+        <th>Vendedor</th>
         <th>Método de Pago</th>
         <th class="num">Total</th>
       </tr>
     </thead>
     <tbody>
-      ${saleRows || '<tr><td colspan="5" style="text-align:center;color:#9ca3af;">Sin transacciones</td></tr>'}
+      ${saleRows || '<tr><td colspan="6" style="text-align:center;color:#9ca3af;">Sin transacciones</td></tr>'}
     </tbody>
   </table>
 

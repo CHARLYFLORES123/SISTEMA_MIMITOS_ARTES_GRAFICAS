@@ -9,9 +9,10 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
-import { Toast } from "@/lib/swal";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Toast, Swal } from "@/lib/swal";
 import { formatCurrency, useCurrency } from "@/contexts/currency-context";
-import { CalendarDays, Check, ChevronsUpDown, ClipboardCheck, Download, LoaderCircle, Plus, Printer, Receipt, RefreshCw, Search, ShoppingBag, User, UserPlus, X, Split, Trash2 } from "lucide-react";
+import { CalendarDays, Check, ChevronsUpDown, ClipboardCheck, Download, LoaderCircle, Pencil, Plus, Printer, Receipt, RefreshCw, Search, ShoppingBag, User, UserPlus, X, Split, Trash2 } from "lucide-react";
 import { usePermissions } from "@/hooks/use-permissions";
 import { downloadReservationTicket, printReservationTicket, ReservationForTicket } from "@/lib/generate-reservation-ticket";
 
@@ -36,7 +37,7 @@ type Reservation = {
   customerName: string | null;
   customerPhone: string | null;
   userName: string | null;
-  status: ReservationStage | "entregada";
+  status: ReservationStage | "entregada" | "cancelada";
   total: number;
   deposit: number;
   balance: number;
@@ -196,6 +197,19 @@ export default function Reservations() {
   const [saving, setSaving] = useState(false);
   const [savingCustomer, setSavingCustomer] = useState(false);
   const [updatingDetailId, setUpdatingDetailId] = useState<number | null>(null);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editSaving, setEditSaving] = useState(false);
+  const [editCustomerId, setEditCustomerId] = useState("none");
+  const [editDeposit, setEditDeposit] = useState("0");
+  const [editIsMixedDeposit, setEditIsMixedDeposit] = useState(false);
+  const [editMixedPayments, setEditMixedPayments] = useState<Array<{ method: string; amount: string }>>([
+    { method: "Efectivo", amount: "" },
+    { method: "Transferencia", amount: "" },
+  ]);
+  const [editReservationDate, setEditReservationDate] = useState(localDate());
+  const [editExpectedAt, setEditExpectedAt] = useState("");
+  const [editNotes, setEditNotes] = useState("");
+  const [editDetails, setEditDetails] = useState<DraftDetail[]>([emptyDetail()]);
   const [filterName, setFilterName] = useState("");
   const [filterPhone, setFilterPhone] = useState("");
   const [filterDate, setFilterDate] = useState("");
@@ -348,7 +362,151 @@ export default function Reservations() {
     }
   };
 
-  const availableReservations = (reservations ?? []).filter((reservation) => reservation.status !== "entregada");
+  const openEditDialog = (reservation: Reservation) => {
+    setEditingId(reservation.id);
+    setEditCustomerId(reservation.customerId ? String(reservation.customerId) : "none");
+    setEditDeposit(String(reservation.deposit));
+    // Detectar si la reserva fue creada con pago dividido (mixto)
+    const resvPayments = reservation.payments ?? [];
+    const activeSplit = resvPayments.filter((p) => (Number(p.amount) || 0) > 0);
+    const wasSplit = activeSplit.length > 1 ||
+      (activeSplit.length === 1 && reservation.depositMethod && reservation.depositMethod.includes("/"));
+    setEditIsMixedDeposit(Boolean(wasSplit));
+    if (wasSplit) {
+      // Precargar los métodos con sus montos, agregando al menos dos filas
+      const rows = activeSplit.map((p) => ({ method: p.paymentMethod, amount: String(p.amount) }));
+      while (rows.length < 2) {
+        const unused = availablePaymentMethods.find((m) => !rows.some((r) => r.method === m)) || "Transferencia";
+        rows.push({ method: unused, amount: "" });
+      }
+      setEditMixedPayments(rows);
+    } else {
+      setEditMixedPayments([
+        { method: "Efectivo", amount: "" },
+        { method: "Transferencia", amount: "" },
+      ]);
+    }
+    setEditReservationDate(reservation.reservationDate);
+    setEditExpectedAt(reservation.expectedAt ? reservation.expectedAt.slice(0, 10) : "");
+    setEditNotes(reservation.notes ?? "");
+    setEditDetails(reservation.details.map((detail) => ({
+      productId: detail.productId ? String(detail.productId) : "",
+      quantity: String(detail.quantity),
+      unitPrice: String(detail.unitPrice),
+      specifications: detail.specifications,
+    })));
+  };
+
+  const editMixedTotal = useMemo(() => {
+    return editMixedPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+  }, [editMixedPayments]);
+
+  const editEffectiveDeposit = editIsMixedDeposit ? editMixedTotal : (Number(editDeposit) || 0);
+
+  const editTotal = useMemo(() => editDetails.reduce((sum, detail) => {
+    return sum + (Number(detail.quantity) || 0) * (Number(detail.unitPrice) || 0);
+  }, 0), [editDetails]);
+
+  const closeEditDialog = () => {
+    setEditingId(null);
+  };
+
+  const saveEdit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (editingId == null) return;
+    const items = editDetails.map((detail) => ({
+      productId: Number(detail.productId),
+      quantity: Number(detail.quantity),
+      unitPrice: Number(detail.unitPrice),
+      specifications: detail.specifications.trim(),
+    }));
+    if (items.some((detail) => !detail.productId || !Number.isFinite(detail.quantity) || detail.quantity <= 0 || !detail.specifications || !Number.isFinite(detail.unitPrice) || detail.unitPrice < 0)) {
+      Toast.fire({ icon: "error", title: "Completa los productos y sus detalles (la cantidad debe ser mayor a 0)" });
+      return;
+    }
+    const depositAmount = editEffectiveDeposit;
+    if (!Number.isFinite(depositAmount) || depositAmount < 0 || depositAmount > editTotal) {
+      Toast.fire({ icon: "error", title: "El adelanto debe estar entre 0 y el total de la reserva" });
+      return;
+    }
+
+    let finalEditDepositMethod: string | null = null;
+    let finalEditPayments: Array<{ paymentMethod: string; amount: number }> | undefined = undefined;
+
+    if (depositAmount > 0) {
+      if (editIsMixedDeposit) {
+        const activeMixed = editMixedPayments
+          .filter((p) => (Number(p.amount) || 0) > 0)
+          .map((p) => ({ paymentMethod: p.method, amount: Number(Number(p.amount).toFixed(2)) }));
+        if (activeMixed.length === 0) {
+          Toast.fire({ icon: "warning", title: "Ingresa los montos para el pago mixto del adelanto" });
+          return;
+        }
+        const activeSum = Number(activeMixed.reduce((s, p) => s + p.amount, 0).toFixed(2));
+        if (Math.abs(activeSum - depositAmount) > 0.05) {
+          Toast.fire({ icon: "warning", title: "La suma de los montos no coincide con el total del adelanto" });
+          return;
+        }
+        finalEditPayments = activeMixed;
+        finalEditDepositMethod = activeMixed.map((p) => `${p.paymentMethod}: ${p.amount.toFixed(2)}`).join(" / ");
+      } else {
+        finalEditDepositMethod = "Efectivo";
+        finalEditPayments = [{ paymentMethod: finalEditDepositMethod, amount: depositAmount }];
+      }
+    }
+
+    setEditSaving(true);
+    try {
+      await request<Reservation>(`/api/reservations/${editingId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          customerId: editCustomerId === "none" ? null : Number(editCustomerId),
+          deposit: depositAmount,
+          depositMethod: finalEditDepositMethod,
+          payments: finalEditPayments,
+          reservationDate: editReservationDate,
+          expectedAt: editExpectedAt || null,
+          notes: editNotes.trim() || null,
+          details: items,
+        }),
+      });
+      Toast.fire({ icon: "success", title: `Reserva #${editingId} actualizada` });
+      closeEditDialog();
+      await queryClient.invalidateQueries({ queryKey: ["/api/reservations"] });
+    } catch (error) {
+      Toast.fire({ icon: "error", title: "No se pudo actualizar la reserva", text: error instanceof Error ? error.message : "Error inesperado" });
+    } finally {
+      setEditSaving(false);
+    }
+  };
+
+  const cancelReservation = async (reservation: Reservation) => {
+    const result = await Swal.fire({
+      title: `¿Anular la reserva #${reservation.id}?`,
+      text: `La reserva quedará anulada (no se listará en pedidos activos ni en reportes). Adelanto registrado: ${formatCurrency(reservation.deposit, currencySymbol)}.`,
+      icon: "warning",
+      showCancelButton: true,
+      confirmButtonColor: "#ef4444",
+      confirmButtonText: "Sí, anular",
+      cancelButtonText: "Cancelar",
+    });
+    if (!result.isConfirmed) return;
+    setActionLoadingId(reservation.id);
+    try {
+      await request<Reservation>(`/api/reservations/${reservation.id}/cancel`, {
+        method: "POST",
+        body: JSON.stringify({ reason: null }),
+      });
+      await queryClient.invalidateQueries({ queryKey: ["/api/reservations"] });
+      Toast.fire({ icon: "success", title: `Reserva #${reservation.id} anulada` });
+    } catch (error) {
+      Toast.fire({ icon: "error", title: "No se pudo anular la reserva", text: error instanceof Error ? error.message : "Error inesperado" });
+    } finally {
+      setActionLoadingId(null);
+    }
+  };
+
+  const availableReservations = (reservations ?? []).filter((reservation) => reservation.status !== "entregada" && reservation.status !== "cancelada");
 
   const filteredReservations = useMemo(() => {
     const name = filterName.trim().toLowerCase();
@@ -891,6 +1049,18 @@ export default function Reservations() {
                         type="button"
                         variant="outline"
                         size="sm"
+                        className="h-8 gap-1.5 border-blue-200 text-blue-700 hover:bg-blue-50"
+                        onClick={() => openEditDialog(reservation)}
+                        disabled={actionLoadingId === reservation.id}
+                        title="Editar esta reserva"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                        Editar
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
                         className="h-8 gap-1.5 border-slate-300 text-slate-700 hover:bg-slate-100"
                         onClick={() => void handleDownloadTicket(reservation)}
                         disabled={actionLoadingId === reservation.id}
@@ -902,6 +1072,18 @@ export default function Reservations() {
                           <Download className="h-3.5 w-3.5 text-muted-foreground" />
                         )}
                         Descargar ticket
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 gap-1.5 border-red-200 text-red-700 hover:bg-red-50"
+                        onClick={() => void cancelReservation(reservation)}
+                        disabled={actionLoadingId === reservation.id}
+                        title="Anular esta reserva"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                        Anular
                       </Button>
                     </div>
 
@@ -917,6 +1099,209 @@ export default function Reservations() {
           </div>
         )}
       </section>
+
+      {editingId != null && (
+        <Dialog open={editingId != null} onOpenChange={(open) => { if (!open) closeEditDialog(); }}>
+          <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle>Editar reserva #{editingId}</DialogTitle>
+              <DialogDescription className="text-xs">
+                Modifica el cliente, productos, adelanto, fechas y notas de la reserva. La etapa de producción se reinicia a "Reserva".
+              </DialogDescription>
+            </DialogHeader>
+            <form onSubmit={saveEdit} className="space-y-4">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-1.5 text-sm">
+                  <span className="font-medium">Cliente</span>
+                  <Select value={editCustomerId} onValueChange={setEditCustomerId}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="none">Sin cliente registrado</SelectItem>
+                      {customers?.map((customer) => (
+                        <SelectItem key={customer.id} value={String(customer.id)}>{customer.name}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1.5 text-sm">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-medium">Adelanto</span>
+                    <Button
+                      type="button"
+                      variant={editIsMixedDeposit ? "default" : "outline"}
+                      size="sm"
+                      className="h-7 text-xs gap-1.5 rounded-lg"
+                      onClick={() => {
+                        const next = !editIsMixedDeposit;
+                        setEditIsMixedDeposit(next);
+                        if (next) {
+                          const cur = Number(editDeposit) || 0;
+                          if (cur > 0) {
+                            setEditMixedPayments([
+                              { method: "Efectivo", amount: (cur / 2).toFixed(2) },
+                              { method: "Transferencia", amount: (cur / 2).toFixed(2) },
+                            ]);
+                          }
+                        } else {
+                          setEditDeposit(String(editMixedTotal > 0 ? editMixedTotal : "0"));
+                        }
+                      }}
+                    >
+                      <Split className="h-3.5 w-3.5" />
+                      {editIsMixedDeposit ? "Cambiar a Pago Simple" : "Dividir Pago"}
+                    </Button>
+                  </div>
+                  {!editIsMixedDeposit && (
+                    <Input type="number" min="0" step="0.01" value={editDeposit} onChange={(event) => setEditDeposit(event.target.value)} />
+                  )}
+                  {editIsMixedDeposit && (
+                    <div className="space-y-2 rounded-lg border border-amber-200 bg-amber-50/50 p-2.5">
+                      <p className="text-xs text-amber-900 font-medium">
+                        Pago Mixto del Adelanto: registra los montos recibidos en cada método.
+                      </p>
+                      {editMixedPayments.map((p, idx) => (
+                        <div key={idx} className="grid grid-cols-[1.5fr_1fr_auto] gap-2 items-center">
+                          <Select
+                            value={p.method}
+                            onValueChange={(val) => {
+                              setEditMixedPayments((curr) => curr.map((item, i) => i === idx ? { ...item, method: val } : item));
+                            }}
+                          >
+                            <SelectTrigger className="h-8 text-xs bg-white">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {availablePaymentMethods.map((method) => (
+                                <SelectItem key={method} value={method}>
+                                  {method}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <Input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            placeholder="Monto"
+                            className="h-8 text-xs bg-white"
+                            value={p.amount}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setEditMixedPayments((curr) => curr.map((item, i) => i === idx ? { ...item, amount: val } : item));
+                            }}
+                          />
+                          {editMixedPayments.length > 2 && (
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                              onClick={() => {
+                                setEditMixedPayments((curr) => curr.filter((_, i) => i !== idx));
+                              }}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          )}
+                        </div>
+                      ))}
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-amber-200/60">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-7 text-xs bg-white"
+                          onClick={() => {
+                            const unusedMethod = availablePaymentMethods.find(
+                              (m) => !editMixedPayments.some((p) => p.method === m)
+                            ) || availablePaymentMethods[0] || "Transferencia";
+                            setEditMixedPayments((curr) => [...curr, { method: unusedMethod, amount: "" }]);
+                          }}
+                        >
+                          <Plus className="h-3 w-3 mr-1" /> Agregar otro método
+                        </Button>
+                        <div className="text-xs font-semibold text-amber-950">
+                          Total Adelanto Mixto:{" "}
+                          <span className="text-primary font-bold text-sm">
+                            {formatCurrency(editMixedTotal, currencySymbol)}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+                <div className="space-y-1.5 text-sm">
+                  <span className="font-medium">Fecha de reserva</span>
+                  <Input type="date" value={editReservationDate} onChange={(event) => setEditReservationDate(event.target.value)} />
+                </div>
+                <div className="space-y-1.5 text-sm">
+                  <span className="font-medium">Fecha estimada de entrega</span>
+                  <Input type="date" value={editExpectedAt} onChange={(event) => setEditExpectedAt(event.target.value)} />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                {editDetails.map((detail, index) => (
+                  <div key={index} className="grid gap-2 rounded-lg border bg-muted/20 p-2 sm:grid-cols-2">
+                    <div className="space-y-1">
+                      <span className="text-xs font-medium">Producto</span>
+                      <Select value={detail.productId} onValueChange={(value) => {
+                        const product = products?.find((item) => String(item.id) === value);
+                        setEditDetails((current) => current.map((d, i) => i === index ? { ...d, productId: value, unitPrice: product ? String(product.salePrice) : d.unitPrice } : d));
+                      }}>
+                        <SelectTrigger className="h-8"><SelectValue placeholder="Seleccionar producto" /></SelectTrigger>
+                        <SelectContent>
+                          {products?.map((product) => (
+                            <SelectItem key={product.id} value={String(product.id)}>{product.name}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-1">
+                      <span className="text-xs font-medium">Especificaciones</span>
+                      <Input className="h-8" value={detail.specifications} onChange={(event) => setEditDetails((current) => current.map((d, i) => i === index ? { ...d, specifications: event.target.value } : d))} />
+                    </div>
+                    <div className="space-y-1">
+                      <span className="text-xs font-medium">Cantidad</span>
+                      <Input type="number" min="0.01" step="any" className="h-8" value={detail.quantity} onChange={(event) => setEditDetails((current) => current.map((d, i) => i === index ? { ...d, quantity: event.target.value } : d))} />
+                    </div>
+                    <div className="flex items-end gap-2">
+                      <div className="space-y-1 flex-1">
+                        <span className="text-xs font-medium">P. unitario</span>
+                        <Input type="number" min="0" step="0.01" className="h-8" value={detail.unitPrice} onChange={(event) => setEditDetails((current) => current.map((d, i) => i === index ? { ...d, unitPrice: event.target.value } : d))} />
+                      </div>
+                      <Button type="button" variant="outline" size="sm" className="h-8" onClick={() => setEditDetails((current) => current.filter((_, i) => i !== index))} disabled={editDetails.length === 1}>
+                        Quitar
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+                <Button type="button" variant="outline" size="sm" onClick={() => setEditDetails((current) => [...current, emptyDetail()])}>
+                  <Plus className="mr-1.5 h-3.5 w-3.5" /> Agregar producto
+                </Button>
+              </div>
+
+              <div className="space-y-1.5 text-sm">
+                <span className="font-medium">Notas</span>
+                <Textarea value={editNotes} onChange={(event) => setEditNotes(event.target.value)} rows={2} />
+              </div>
+
+              <div className="rounded-lg bg-muted/40 px-3 py-2 text-sm">
+                <p>Total: <strong>{formatCurrency(editTotal, currencySymbol)}</strong></p>
+                <p>Saldo pendiente: <strong>{formatCurrency(Math.max(0, editTotal - editEffectiveDeposit), currencySymbol)}</strong></p>
+              </div>
+
+              <DialogFooter>
+                <Button type="button" variant="outline" onClick={closeEditDialog} disabled={editSaving}>Cancelar</Button>
+                <Button type="submit" disabled={editSaving}>
+                  {editSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Check className="mr-2 h-4 w-4" />}
+                  Guardar cambios
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
     </div>
   );
 }

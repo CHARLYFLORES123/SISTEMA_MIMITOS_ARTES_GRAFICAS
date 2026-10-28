@@ -2,7 +2,7 @@ import { useState, useMemo } from "react";
 import { format } from "date-fns";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { customFetch } from "@workspace/api-client-react";
-import { useGetSales, useGetBusinessSettings } from "@workspace/api-client-react";
+import { useGetSales, useGetBusinessSettings, useGetUsers } from "@workspace/api-client-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/badge";
 import {
   TrendingUp, Receipt, Printer, Download, CalendarDays,
   Banknote, ShoppingBag, XCircle, ArrowRight, LockKeyhole, UnlockKeyhole,
+  Building2, Users,
 } from "lucide-react";
 import { useCurrency, formatCurrency } from "@/contexts/currency-context";
 import { computeCierreData, printCierre } from "@/lib/generate-cierre";
@@ -31,6 +32,7 @@ type ReservationDepositItem = {
   id: number;
   customerName: string;
   userName?: string;
+  userId?: number | null;
   total: number;
   deposit: number;
   depositMethod: string | null;
@@ -38,23 +40,46 @@ type ReservationDepositItem = {
   payments: Array<{ paymentMethod: string; amount: number }>;
 };
 
+type SessionBreakdownItem = {
+  id: number;
+  userId: number;
+  userName: string;
+  userRole?: string;
+  status: "open" | "closed";
+  openingAmount: number;
+  cashSales: number;
+  cashDeposits: number;
+  totalDeposits: number;
+  totalExpenses?: number;
+  expectedCash: number;
+  countedCash: number | null;
+  difference: number | null;
+  openedAt: string;
+  closedAt: string | null;
+};
+
 type CashRegisterSession = {
   id: number;
+  userId?: number | null;
+  userName?: string;
+  userRole?: string;
   businessDate: string;
   status: "open" | "closed";
+  isConsolidated?: boolean;
   openingAmount: number;
   cashSales: number;
   cashDeposits?: number;
   totalDeposits?: number;
   deposits?: ReservationDepositItem[];
   totalsByMethod: Record<string, number>;
-  expenses: Array<{ id: number; description: string; amount: number; authorizedByName: string; createdAt: string }>;
+  expenses: Array<{ id: number; sessionId?: number; description: string; amount: number; authorizedByName: string; createdAt: string }>;
   totalExpenses: number;
   expectedCash: number;
   countedCash: number | null;
   difference: number | null;
   openedAt: string;
   closedAt: string | null;
+  sessions?: SessionBreakdownItem[];
 } | null;
 
 export default function CierreCaja() {
@@ -65,22 +90,37 @@ export default function CierreCaja() {
   const [expenseDescription, setExpenseDescription] = useState("");
   const [expenseAmount, setExpenseAmount] = useState("");
   const [cashActionLoading, setCashActionLoading] = useState(false);
+  const [selectedUserId, setSelectedUserId] = useState<string>("all");
 
   const { currencySymbol } = useCurrency();
   const { data: settings } = useGetBusinessSettings();
   const { role, user } = usePermissions();
-  const canAuthorizeExpenses = ["admin", "inventario", "vendedor"].includes(role.toLowerCase());
+  const isAdmin = role.toLowerCase() === "admin";
   const isSeller = role.toLowerCase() === "vendedor";
+  const canAuthorizeExpenses = ["admin", "inventario", "vendedor"].includes(role.toLowerCase());
+
+  const { data: allUsers = [] } = useGetUsers({ query: { enabled: isAdmin } as any });
+  const sellersAndAdmins = useMemo(() => {
+    return (allUsers as any[]).filter((u) =>
+      ["vendedor", "admin", "diseñador"].includes((u.role ?? "").toLowerCase())
+    );
+  }, [allUsers]);
+
+  const effectiveUserId = isAdmin ? selectedUserId : (user?.id ? String(user.id) : "");
   const queryClient = useQueryClient();
+
   const { data: registerSession, isLoading: registerLoading, error: registerError } = useQuery<CashRegisterSession>({
-    queryKey: ["/api/cash-register", date],
-    queryFn: () => customFetch(`/api/cash-register?date=${date}`),
+    queryKey: ["/api/cash-register", date, effectiveUserId],
+    queryFn: () =>
+      customFetch(
+        `/api/cash-register?date=${date}${effectiveUserId && effectiveUserId !== "all" ? `&userId=${effectiveUserId}` : ""}`
+      ),
     enabled: !!date,
     refetchInterval: 15000,
   });
 
   const refreshRegister = async () => {
-    await queryClient.invalidateQueries({ queryKey: ["/api/cash-register", date] });
+    await queryClient.invalidateQueries({ queryKey: ["/api/cash-register"] });
     await queryClient.invalidateQueries({ queryKey: ["/api/sales"] });
   };
 
@@ -141,13 +181,13 @@ export default function CierreCaja() {
     }
   };
 
-  const [transactionTab, setTransactionTab] = useState<"all" | "sales" | "deposits">("all");
+  const [transactionTab, setTransactionTab] = useState<"all" | "sales" | "deliveries" | "deposits">("all");
 
   const { data: rawSales = [], isLoading } = useGetSales(
     {
       dateFrom: date,
       dateTo: date,
-      ...(isSeller && user?.id ? { userId: user.id } : {}),
+      ...(effectiveUserId && effectiveUserId !== "all" ? { userId: Number(effectiveUserId) } : {}),
     },
     { query: { enabled: !!date } as any }
   );
@@ -162,7 +202,7 @@ export default function CierreCaja() {
   type Movement = {
     id: string;
     rawId: number;
-    type: "sale" | "deposit";
+    type: "sale" | "deposit" | "reservation_delivery";
     docNumber: string;
     createdAt: string;
     customerName: string;
@@ -170,6 +210,7 @@ export default function CierreCaja() {
     paymentMethod: string;
     amount: number;
     secondaryAmount?: number;
+    depositAmount?: number;
     status: string;
     link: string;
   };
@@ -178,22 +219,61 @@ export default function CierreCaja() {
     const movements: Movement[] = [];
 
     for (const s of cierreData.sales) {
+      const isResv = Boolean(
+        s.isReservationDelivery ||
+        s.reservationId ||
+        (s.notes && s.notes.includes("Entrega de reserva #"))
+      );
       const paymentStr = s.payments?.length
         ? s.payments.map((p) => `${p.paymentMethod}: ${formatCurrency(p.amount, currencySymbol)}`).join(" / ")
         : s.paymentMethod;
-      movements.push({
-        id: `sale-${s.id}`,
-        rawId: s.id,
-        type: "sale",
-        docNumber: `#${String(s.id).padStart(6, "0")}`,
-        createdAt: s.createdAt,
-        customerName: s.customerName || "Consumidor Final",
-        userName: (s as any).userName || "—",
-        paymentMethod: paymentStr,
-        amount: s.total,
-        status: s.status,
-        link: `/sales/${s.id}`,
-      });
+
+      if (isResv) {
+        let resvId = s.reservationId ?? null;
+        let deposit = s.reservationDeposit ?? null;
+        if (!resvId && s.notes) {
+          const m = s.notes.match(/Entrega de reserva #(\d+)/);
+          if (m) resvId = Number(m[1]);
+        }
+        if (deposit === null && s.notes) {
+          const m = s.notes.match(/Adelanto recibido previamente:\s*([0-9.]+)/);
+          if (m) deposit = Number(m[1]);
+        }
+        const depAmount = Math.max(0, deposit ?? 0);
+        const balance = s.reservationBalance != null
+          ? s.reservationBalance
+          : (s.amountPaid != null ? Number(s.amountPaid) : Math.max(0, s.total - depAmount));
+
+        movements.push({
+          id: `sale-resv-${s.id}`,
+          rawId: s.id,
+          type: "reservation_delivery",
+          docNumber: `#${String(s.id).padStart(6, "0")} (Reserva #${resvId || "—"})`,
+          createdAt: s.createdAt,
+          customerName: s.customerName || "Consumidor Final",
+          userName: (s as any).userName || "—",
+          paymentMethod: paymentStr,
+          amount: balance, // Saldo a cobrar recaudado
+          secondaryAmount: s.total, // Total de la reserva
+          depositAmount: depAmount, // Adelanto recibido
+          status: "entrega_reserva",
+          link: resvId ? `/reservations` : `/sales/${s.id}`,
+        });
+      } else {
+        movements.push({
+          id: `sale-${s.id}`,
+          rawId: s.id,
+          type: "sale",
+          docNumber: `#${String(s.id).padStart(6, "0")}`,
+          createdAt: s.createdAt,
+          customerName: s.customerName || "Consumidor Final",
+          userName: (s as any).userName || "—",
+          paymentMethod: paymentStr,
+          amount: s.total,
+          status: s.status,
+          link: `/sales/${s.id}`,
+        });
+      }
     }
 
     if (registerSession?.deposits) {
@@ -224,6 +304,7 @@ export default function CierreCaja() {
 
   const filteredMovements = useMemo(() => {
     if (transactionTab === "sales") return combinedMovements.filter((m) => m.type === "sale");
+    if (transactionTab === "deliveries") return combinedMovements.filter((m) => m.type === "reservation_delivery");
     if (transactionTab === "deposits") return combinedMovements.filter((m) => m.type === "deposit");
     return combinedMovements;
   }, [combinedMovements, transactionTab]);
@@ -237,15 +318,15 @@ export default function CierreCaja() {
 
   const handleExport = () => {
     const rows = combinedMovements.map((m) => ({
-      "Tipo": m.type === "sale" ? "Venta Directa" : "Adelanto de Reserva",
+      "Tipo": m.type === "sale" ? "Venta Directa" : m.type === "reservation_delivery" ? "Entrega de Reserva (Saldo)" : "Adelanto de Reserva",
       "N° Documento": m.docNumber,
       "Fecha/Hora": new Date(m.createdAt).toLocaleString("es-BO"),
       "Cliente": m.customerName,
-      "Usuario": m.userName,
+      "Vendedor / Usuario": m.userName,
       "Método de Pago": m.paymentMethod,
       "Monto Recaudado": m.amount,
       "Total Operación": m.secondaryAmount ?? m.amount,
-      "Estado": m.status === "adelanto" ? "Adelanto Recibido" : m.status,
+      "Estado": m.status === "adelanto" ? "Adelanto Recibido" : m.status === "entrega_reserva" ? "Reserva Entregada y Cobrada" : m.status,
     }));
     const summary = [
       ...cierreData.groups.map((g) => ({
@@ -254,9 +335,29 @@ export default function CierreCaja() {
         "Total": g.total,
       })),
       {
-        "Concepto": "--- TOTALES GENERALES ---",
-        "Transacciones": cierreData.countCompleted + (registerSession?.deposits?.length || 0),
-        "Total": cierreData.grandTotal ?? (cierreData.totalCompleted + (registerSession?.totalDeposits || 0)),
+        "Concepto": "--- DESGLOSE POR CONCEPTO ---",
+        "Transacciones": cierreData.countCompleted,
+        "Total": cierreData.grandTotal,
+      },
+      {
+        "Concepto": "Ventas Directas",
+        "Transacciones": cierreData.countDirectSales,
+        "Total": cierreData.totalDirectSales,
+      },
+      {
+        "Concepto": "Adelantos de Reservas",
+        "Transacciones": cierreData.countNewDeposits,
+        "Total": cierreData.totalDeposits,
+      },
+      {
+        "Concepto": "Saldo a Cobrar de Reservas (Entregas)",
+        "Transacciones": cierreData.countReservationDeliveries,
+        "Total": cierreData.totalReservationBalances,
+      },
+      {
+        "Concepto": "TOTAL RECAUDADO",
+        "Transacciones": cierreData.countCompleted,
+        "Total": cierreData.grandTotal,
       },
     ];
 
@@ -268,13 +369,15 @@ export default function CierreCaja() {
         "N° Reserva": `#${String(dep.id).padStart(6, "0")}`,
         "Fecha/Hora": new Date(dep.createdAt).toLocaleString("es-BO"),
         "Cliente": dep.customerName,
+        "Vendedor": dep.userName || "—",
         "Total Reserva": dep.total,
         "Adelanto Recibido": dep.deposit,
         "Método / Desglose de Montos": dep.payments?.map((p) => `${p.paymentMethod}: ${p.amount.toFixed(2)}`).join(" / ") || dep.depositMethod || "Efectivo",
       }));
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(depositRows), "Adelantos de Reserva");
     }
-    XLSX.writeFile(wb, `Cierre_Caja_${date}.xlsx`);
+    const label = selectedUserId === "all" ? "Consolidado" : (registerSession?.userName || "Usuario").replace(/\s+/g, "_");
+    XLSX.writeFile(wb, `Cierre_Caja_${date}_${label}.xlsx`);
   };
 
   const handleExportPDF = () => {
@@ -283,35 +386,34 @@ export default function CierreCaja() {
         .map(([method, total]) => `${method}: ${formatCurrency(total, currencySymbol)}`)
         .join(" · ")
       : "";
-    const depositDetails = registerSession?.deposits?.length
-      ? ` · Adelantos de reservas: ${formatCurrency(registerSession.totalDeposits ?? 0, currencySymbol)} (${registerSession.deposits.map(d => `#${d.id}: ${d.deposit.toFixed(2)} [${d.payments.map(p => `${p.paymentMethod}: ${p.amount.toFixed(2)}`).join(" / ")}]`).join(", ")})`
-      : "";
+    const breakdownDetails = `Ventas directas: ${formatCurrency(cierreData.totalDirectSales, currencySymbol)} · Adelantos: ${formatCurrency(cierreData.totalDeposits, currencySymbol)} · Saldo a cobrar reservas: ${formatCurrency(cierreData.totalReservationBalances, currencySymbol)} · TOTAL RECAUDADO: ${formatCurrency(cierreData.grandTotal, currencySymbol)}`;
     const expenseDetails = registerSession?.expenses.length
       ? ` · Gastos: ${registerSession.expenses.map((expense) => `${expense.description} (${formatCurrency(expense.amount, currencySymbol)})`).join(", ")}`
       : "";
     const cashSummary = registerSession
-      ? `Apertura: ${formatCurrency(registerSession.openingAmount, currencySymbol)} · Ventas/Cobros: ${paymentTotals || "sin movimientos"}${depositDetails} · Gastos autorizados: ${formatCurrency(registerSession.totalExpenses, currencySymbol)} · Efectivo esperado: ${formatCurrency(registerSession.expectedCash, currencySymbol)}${registerSession.countedCash !== null ? ` · Efectivo contado: ${formatCurrency(registerSession.countedCash, currencySymbol)} · Diferencia: ${formatCurrency(registerSession.difference ?? 0, currencySymbol)}` : ""}${expenseDetails}`
-      : "No hay una caja abierta o cerrada para esta fecha";
+      ? `Apertura: ${formatCurrency(registerSession.openingAmount, currencySymbol)} · ${breakdownDetails} · Ventas/Cobros: ${paymentTotals || "sin movimientos"}${expenseDetails} · Efectivo esperado: ${formatCurrency(registerSession.expectedCash, currencySymbol)}${registerSession.countedCash !== null ? ` · Efectivo contado: ${formatCurrency(registerSession.countedCash, currencySymbol)} · Diferencia: ${formatCurrency(registerSession.difference ?? 0, currencySymbol)}` : ""}`
+      : breakdownDetails;
+    const titleLabel = selectedUserId === "all" ? "Consolidado General" : (registerSession?.userName || "Usuario");
     exportTablePDF({
-      title: `Cierre de Caja · ${date}`,
-      fileName: `Cierre_Caja_${date}.pdf`,
+      title: `Cierre de Caja · ${date} · ${titleLabel}`,
+      fileName: `Cierre_Caja_${date}_${titleLabel.replace(/\s+/g, "_")}.pdf`,
       subtitle: cashSummary,
-      headers: ["Tipo", "N° Doc", "Fecha/Hora", "Cliente", "Usuario", "Métodos de pago", "Monto", "Estado"],
+      headers: ["Tipo", "N° Doc", "Fecha/Hora", "Cliente", "Vendedor / Usuario", "Métodos de pago", "Monto", "Estado"],
       rows: combinedMovements.map((m) => [
-        m.type === "sale" ? "Venta" : "Adelanto Res.",
+        m.type === "sale" ? "Venta Directa" : m.type === "reservation_delivery" ? "Entrega Reserva (Saldo)" : "Adelanto Reserva",
         m.docNumber,
         new Date(m.createdAt).toLocaleString("es-BO"),
         m.customerName,
         m.userName,
         m.paymentMethod,
         formatCurrency(m.amount, currencySymbol),
-        m.status === "adelanto" ? "Adelanto Recibido" : m.status,
+        m.status === "adelanto" ? "Adelanto Recibido" : m.status === "entrega_reserva" ? "Reserva Entregada y Cobrada" : m.status,
       ]),
     });
   };
 
   const avg = cierreData.countCompleted > 0
-    ? cierreData.totalCompleted / cierreData.countCompleted
+    ? cierreData.grandTotal / cierreData.countCompleted
     : 0;
 
   return (
@@ -326,6 +428,25 @@ export default function CierreCaja() {
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
+          {isAdmin && (
+            <div className="flex items-center gap-1.5 border border-input rounded-xl px-3 py-1.5 bg-card shadow-sm">
+              <Users className="w-4 h-4 text-primary shrink-0" />
+              <select
+                value={selectedUserId}
+                onChange={(e) => setSelectedUserId(e.target.value)}
+                aria-label="Filtrar por vendedor o caja"
+                className="border-0 p-0 text-sm focus:ring-0 bg-transparent text-foreground cursor-pointer outline-none font-medium max-w-[210px] truncate"
+              >
+                <option value="all">🏢 Todos los vendedores (Consolidado)</option>
+                {sellersAndAdmins.map((u) => (
+                  <option key={u.id} value={String(u.id)}>
+                    👤 {u.name} ({u.role})
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
           <div className="flex items-center gap-1.5 border border-input rounded-xl px-3 py-1.5 bg-card shadow-sm">
             <CalendarDays className="w-4 h-4 text-muted-foreground" />
             <Input
@@ -375,129 +496,252 @@ export default function CierreCaja() {
 
       <Card className="border-primary/15 shadow-sm">
         <CardHeader className="pb-3">
-          <CardTitle className="flex items-center gap-2 text-base">
-            {registerSession?.status === "open" ? <UnlockKeyhole className="h-4 w-4 text-emerald-600" /> : <LockKeyhole className="h-4 w-4 text-primary" />}
-            Apertura y cierre de caja
-          </CardTitle>
-          <p className="text-xs text-muted-foreground">Caja individual del usuario · {date}</p>
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <CardTitle className="flex items-center gap-2 text-base">
+                {registerSession?.isConsolidated ? (
+                  <Building2 className="h-4 w-4 text-primary" />
+                ) : registerSession?.status === "open" ? (
+                  <UnlockKeyhole className="h-4 w-4 text-emerald-600" />
+                ) : (
+                  <LockKeyhole className="h-4 w-4 text-primary" />
+                )}
+                {registerSession?.isConsolidated
+                  ? "Cierre de Caja Consolidado · Todos los Vendedores"
+                  : registerSession
+                    ? `Caja de ${registerSession.userName} · ${date}`
+                    : `Caja individual · ${date}`}
+              </CardTitle>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                {registerSession?.isConsolidated
+                  ? `Resumen general acumulado de todas las cajas registradas para el día · ${date}`
+                  : `Caja individual del usuario · ${date}`}
+              </p>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              {registerSession?.isConsolidated ? (
+                <Badge variant="outline" className="bg-primary/10 text-primary border-primary/20 text-xs font-semibold py-1 px-2.5">
+                  Consolidado General ({registerSession.sessions?.length || 0} cajas)
+                </Badge>
+              ) : isAdmin && selectedUserId !== "all" ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="text-xs rounded-xl gap-1.5 h-8"
+                  onClick={() => setSelectedUserId("all")}
+                >
+                  <Building2 className="w-3.5 h-3.5" />
+                  Ver Consolidado General
+                </Button>
+              ) : null}
+            </div>
+          </div>
         </CardHeader>
         <CardContent className="space-y-4">
-          {registerLoading ? <p className="text-sm text-muted-foreground">Consultando caja...</p>
-            : registerError ? <p role="alert" className="text-sm text-destructive">{registerError instanceof Error ? registerError.message : "No se pudo consultar la caja"}</p>
-              : !registerSession ? date !== format(new Date(), "yyyy-MM-dd") ? (
-                <p className="text-sm text-muted-foreground">No existe una caja registrada para esta fecha. La apertura solo se puede realizar para el día actual.</p>
-              ) : (
-                <form className="flex flex-col gap-3 sm:flex-row sm:items-end" onSubmit={(event) => { event.preventDefault(); void handleOpenRegister(); }}>
-                  <label className="space-y-1.5 text-sm font-medium">
-                    Efectivo inicial
-                    <Input type="number" min="0" step="0.01" required value={openingAmount} onChange={(event) => setOpeningAmount(event.target.value)} placeholder="300.00" />
-                  </label>
-                  <Button type="submit" disabled={cashActionLoading || openingAmount === ""}>
-                    <UnlockKeyhole className="mr-2 h-4 w-4" /> Abrir caja
-                  </Button>
-                </form>
-              ) : <>
-                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-                  <div className="rounded-lg bg-muted/50 p-3">
-                    <p className="text-xs text-muted-foreground">Efectivo inicial</p>
-                    <p className="text-lg font-bold">{formatCurrency(registerSession.openingAmount, currencySymbol)}</p>
+          {registerLoading ? (
+            <p className="text-sm text-muted-foreground">Consultando caja...</p>
+          ) : registerError ? (
+            <p role="alert" className="text-sm text-destructive">
+              {registerError instanceof Error ? registerError.message : "No se pudo consultar la caja"}
+            </p>
+          ) : !registerSession ? (
+            isAdmin && selectedUserId !== "all" ? (
+              <div className="p-4 rounded-xl bg-muted/30 border text-center space-y-2">
+                <p className="text-sm text-muted-foreground">
+                  El usuario seleccionado ({sellersAndAdmins.find((u) => String(u.id) === selectedUserId)?.name || "seleccionado"}) no tiene una caja abierta o cerrada para la fecha {date}.
+                </p>
+                <Button variant="outline" size="sm" onClick={() => setSelectedUserId("all")} className="rounded-xl">
+                  <Building2 className="mr-1.5 h-3.5 w-3.5" /> Volver a Consolidado General
+                </Button>
+              </div>
+            ) : date !== format(new Date(), "yyyy-MM-dd") ? (
+              <p className="text-sm text-muted-foreground">
+                No existe una caja registrada para esta fecha. La apertura solo se puede realizar para el día actual.
+              </p>
+            ) : (
+              <form
+                className="flex flex-col gap-3 sm:flex-row sm:items-end"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void handleOpenRegister();
+                }}
+              >
+                <label className="space-y-1.5 text-sm font-medium">
+                  Efectivo inicial
+                  <Input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    required
+                    value={openingAmount}
+                    onChange={(event) => setOpeningAmount(event.target.value)}
+                    placeholder="300.00"
+                  />
+                </label>
+                <Button type="submit" disabled={cashActionLoading || openingAmount === ""}>
+                  <UnlockKeyhole className="mr-2 h-4 w-4" /> Abrir caja
+                </Button>
+              </form>
+            )
+          ) : (
+            <>
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+                <div className="rounded-lg bg-muted/50 p-3">
+                  <p className="text-xs text-muted-foreground">Efectivo inicial {registerSession.isConsolidated ? "(Total)" : ""}</p>
+                  <p className="text-lg font-bold">{formatCurrency(registerSession.openingAmount, currencySymbol)}</p>
+                </div>
+                <div className="rounded-lg bg-emerald-50 p-3">
+                  <p className="text-xs text-muted-foreground">Ventas en efectivo</p>
+                  <p className="text-lg font-bold text-emerald-700">+{formatCurrency(registerSession.cashSales, currencySymbol)}</p>
+                </div>
+                <div className="rounded-lg bg-amber-50 p-3">
+                  <p className="text-xs text-muted-foreground">Adelantos en efectivo</p>
+                  <p className="text-lg font-bold text-amber-700">+{formatCurrency(registerSession.cashDeposits ?? 0, currencySymbol)}</p>
+                  {Boolean(registerSession.totalDeposits && registerSession.totalDeposits > 0) && (
+                    <p className="text-[10px] text-muted-foreground mt-0.5">Total adelantos: {formatCurrency(registerSession.totalDeposits ?? 0, currencySymbol)}</p>
+                  )}
+                </div>
+                <div className="rounded-lg bg-red-50 p-3">
+                  <p className="text-xs text-muted-foreground">Gastos autorizados</p>
+                  <p className="text-lg font-bold text-red-700">-{formatCurrency(registerSession.totalExpenses, currencySymbol)}</p>
+                </div>
+                <div className="rounded-lg bg-primary/5 p-3">
+                  <p className="text-xs text-muted-foreground">Efectivo esperado {registerSession.isConsolidated ? "(Total)" : ""}</p>
+                  <p className="text-lg font-bold text-primary">{formatCurrency(registerSession.expectedCash, currencySymbol)}</p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
+                {Object.entries(registerSession.totalsByMethod).map(([method, total]) => (
+                  <span key={method}>{method}: {formatCurrency(total, currencySymbol)}</span>
+                ))}
+              </div>
+
+              {/* Individual Cash Sessions Breakdown (Only in Consolidated Mode) */}
+              {registerSession.isConsolidated && registerSession.sessions && registerSession.sessions.length > 0 && (
+                <div className="space-y-2 pt-2 border-t">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-1.5">
+                      <Users className="h-3.5 w-3.5 text-primary" />
+                      Cajas Individuales de Vendedores ({registerSession.sessions.length})
+                    </p>
+                    <span className="text-[11px] text-muted-foreground">Haz clic en una caja para ver o gestionar</span>
                   </div>
-                  <div className="rounded-lg bg-emerald-50 p-3">
-                    <p className="text-xs text-muted-foreground">Ventas en efectivo</p>
-                    <p className="text-lg font-bold text-emerald-700">+{formatCurrency(registerSession.cashSales, currencySymbol)}</p>
-                  </div>
-                  <div className="rounded-lg bg-amber-50 p-3">
-                    <p className="text-xs text-muted-foreground">Adelantos en efectivo</p>
-                    <p className="text-lg font-bold text-amber-700">+{formatCurrency(registerSession.cashDeposits ?? 0, currencySymbol)}</p>
-                    {Boolean(registerSession.totalDeposits && registerSession.totalDeposits > 0) && (
-                      <p className="text-[10px] text-muted-foreground mt-0.5">Total adelantos: {formatCurrency(registerSession.totalDeposits ?? 0, currencySymbol)}</p>
-                    )}
-                  </div>
-                  <div className="rounded-lg bg-red-50 p-3">
-                    <p className="text-xs text-muted-foreground">Gastos autorizados</p>
-                    <p className="text-lg font-bold text-red-700">-{formatCurrency(registerSession.totalExpenses, currencySymbol)}</p>
-                  </div>
-                  <div className="rounded-lg bg-primary/5 p-3">
-                    <p className="text-xs text-muted-foreground">Efectivo esperado</p>
-                    <p className="text-lg font-bold text-primary">{formatCurrency(registerSession.expectedCash, currencySymbol)}</p>
+                  <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                    {registerSession.sessions.map((s) => (
+                      <div
+                        key={s.id}
+                        onClick={() => setSelectedUserId(String(s.userId))}
+                        className="rounded-xl border bg-card hover:bg-muted/40 p-3 cursor-pointer transition-all hover:border-primary/50 shadow-2xs group"
+                      >
+                        <div className="flex items-center justify-between mb-1.5">
+                          <p className="font-semibold text-xs truncate group-hover:text-primary transition-colors">{s.userName}</p>
+                          <Badge variant={s.status === "open" ? "default" : "secondary"} className={`text-[10px] py-0 px-1.5 ${s.status === "open" ? "bg-emerald-100 text-emerald-800 border-emerald-300" : ""}`}>
+                            {s.status === "open" ? "Abierta" : "Cerrada"}
+                          </Badge>
+                        </div>
+                        <div className="text-[11px] text-muted-foreground space-y-0.5">
+                          <div className="flex justify-between">
+                            <span>Apertura:</span>
+                            <span className="font-medium text-foreground">{formatCurrency(s.openingAmount, currencySymbol)}</span>
+                          </div>
+                          <div className="flex justify-between">
+                            <span>Ventas Ef.:</span>
+                            <span className="font-medium text-foreground">+{formatCurrency(s.cashSales, currencySymbol)}</span>
+                          </div>
+                          <div className="flex justify-between">
+                            <span>Adelantos Ef.:</span>
+                            <span className="font-medium text-amber-700">+{formatCurrency(s.cashDeposits, currencySymbol)}</span>
+                          </div>
+                          <div className="flex justify-between border-t pt-1 font-bold">
+                            <span>Esperado:</span>
+                            <span className="text-primary">{formatCurrency(s.expectedCash, currencySymbol)}</span>
+                          </div>
+                        </div>
+                        <p className="text-[10px] text-primary mt-2 font-medium flex items-center justify-end gap-1 opacity-80 group-hover:opacity-100">
+                          Ver detalle <ArrowRight className="w-3 h-3" />
+                        </p>
+                      </div>
+                    ))}
                   </div>
                 </div>
+              )}
 
-                <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
-                  {Object.entries(registerSession.totalsByMethod).map(([method, total]) => (
-                    <span key={method}>{method}: {formatCurrency(total, currencySymbol)}</span>
-                  ))}
-                </div>
-
-                {registerSession.deposits && registerSession.deposits.length > 0 && (
-                  <div className="space-y-2 pt-2 border-t">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <p className="text-sm font-semibold flex items-center gap-1.5">
-                        <CalendarDays className="h-4 w-4 text-amber-600" />
-                        Adelantos de Reservas Recibidos en Caja ({registerSession.deposits.length})
-                      </p>
-                      <Badge variant="outline" className="bg-amber-50 text-amber-900 border-amber-200 text-xs font-bold">
-                        Total adelantos: {formatCurrency(registerSession.totalDeposits ?? 0, currencySymbol)}
-                      </Badge>
-                    </div>
-                    <div className="rounded-lg border overflow-hidden">
-                      <Table>
-                        <TableHeader>
-                          <TableRow className="bg-muted/40 text-xs">
-                            <TableHead className="py-2">N° Reserva</TableHead>
-                            <TableHead className="py-2">Hora</TableHead>
-                            <TableHead className="py-2">Cliente</TableHead>
-                            <TableHead className="py-2 text-right">Total Reserva</TableHead>
-                            <TableHead className="py-2 text-right">Adelanto Recibido</TableHead>
-                            <TableHead className="py-2">Método de Pago / Desglose de Montos</TableHead>
+              {/* Reservation deposits received */}
+              {registerSession.deposits && registerSession.deposits.length > 0 && (
+                <div className="space-y-2 pt-2 border-t">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-sm font-semibold flex items-center gap-1.5">
+                      <CalendarDays className="h-4 w-4 text-amber-600" />
+                      Adelantos de Reservas Recibidos en Caja ({registerSession.deposits.length})
+                    </p>
+                    <Badge variant="outline" className="bg-amber-50 text-amber-900 border-amber-200 text-xs font-bold">
+                      Total adelantos: {formatCurrency(registerSession.totalDeposits ?? 0, currencySymbol)}
+                    </Badge>
+                  </div>
+                  <div className="rounded-lg border overflow-hidden">
+                    <Table>
+                      <TableHeader>
+                        <TableRow className="bg-muted/40 text-xs">
+                          <TableHead className="py-2">N° Reserva</TableHead>
+                          <TableHead className="py-2">Hora</TableHead>
+                          <TableHead className="py-2">Cliente</TableHead>
+                          <TableHead className="py-2">Vendedor</TableHead>
+                          <TableHead className="py-2 text-right">Total Reserva</TableHead>
+                          <TableHead className="py-2 text-right">Adelanto Recibido</TableHead>
+                          <TableHead className="py-2">Método de Pago / Desglose de Montos</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {registerSession.deposits.map((dep) => (
+                          <TableRow key={dep.id} className="text-xs hover:bg-muted/20">
+                            <TableCell className="font-mono font-bold text-primary">
+                              #{String(dep.id).padStart(6, "0")}
+                            </TableCell>
+                            <TableCell className="text-muted-foreground">
+                              {new Date(dep.createdAt).toLocaleTimeString("es-BO", { hour: "2-digit", minute: "2-digit" })}
+                            </TableCell>
+                            <TableCell className="font-medium">
+                              {dep.customerName}
+                            </TableCell>
+                            <TableCell className="font-medium text-muted-foreground">
+                              {dep.userName || "—"}
+                            </TableCell>
+                            <TableCell className="text-right">
+                              {formatCurrency(dep.total, currencySymbol)}
+                            </TableCell>
+                            <TableCell className="text-right font-bold text-emerald-700">
+                              +{formatCurrency(dep.deposit, currencySymbol)}
+                            </TableCell>
+                            <TableCell>
+                              {dep.payments && dep.payments.length > 1 ? (
+                                <div className="flex flex-wrap gap-1">
+                                  {dep.payments.map((p, i) => (
+                                    <Badge key={i} variant="secondary" className="text-[10px] bg-amber-50 text-amber-900 border border-amber-200 py-0 font-medium">
+                                      {p.paymentMethod}: {formatCurrency(p.amount, currencySymbol)}
+                                    </Badge>
+                                  ))}
+                                </div>
+                              ) : dep.payments && dep.payments.length === 1 ? (
+                                <Badge variant="outline" className="text-[10px]">
+                                  {dep.payments[0].paymentMethod}: {formatCurrency(dep.payments[0].amount, currencySymbol)}
+                                </Badge>
+                              ) : (
+                                <Badge variant="outline" className="text-[10px]">
+                                  {dep.depositMethod || "Efectivo"}
+                                </Badge>
+                              )}
+                            </TableCell>
                           </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                          {registerSession.deposits.map((dep) => (
-                            <TableRow key={dep.id} className="text-xs hover:bg-muted/20">
-                              <TableCell className="font-mono font-bold text-primary">
-                                #{String(dep.id).padStart(6, "0")}
-                              </TableCell>
-                              <TableCell className="text-muted-foreground">
-                                {new Date(dep.createdAt).toLocaleTimeString("es-BO", { hour: "2-digit", minute: "2-digit" })}
-                              </TableCell>
-                              <TableCell className="font-medium">
-                                {dep.customerName}
-                              </TableCell>
-                              <TableCell className="text-right">
-                                {formatCurrency(dep.total, currencySymbol)}
-                              </TableCell>
-                              <TableCell className="text-right font-bold text-emerald-700">
-                                +{formatCurrency(dep.deposit, currencySymbol)}
-                              </TableCell>
-                              <TableCell>
-                                {dep.payments && dep.payments.length > 1 ? (
-                                  <div className="flex flex-wrap gap-1">
-                                    {dep.payments.map((p, i) => (
-                                      <Badge key={i} variant="secondary" className="text-[10px] bg-amber-50 text-amber-900 border border-amber-200 py-0 font-medium">
-                                        {p.paymentMethod}: {formatCurrency(p.amount, currencySymbol)}
-                                      </Badge>
-                                    ))}
-                                  </div>
-                                ) : dep.payments && dep.payments.length === 1 ? (
-                                  <Badge variant="outline" className="text-[10px]">
-                                    {dep.payments[0].paymentMethod}: {formatCurrency(dep.payments[0].amount, currencySymbol)}
-                                  </Badge>
-                                ) : (
-                                  <Badge variant="outline" className="text-[10px]">
-                                    {dep.depositMethod || "Efectivo"}
-                                  </Badge>
-                                )}
-                              </TableCell>
-                            </TableRow>
-                          ))}
-                        </TableBody>
-                      </Table>
-                    </div>
+                        ))}
+                      </TableBody>
+                    </Table>
                   </div>
-                )}
+                </div>
+              )}
 
-                {registerSession.expenses.length > 0 && <div className="space-y-1">
+              {registerSession.expenses.length > 0 && (
+                <div className="space-y-1 pt-2 border-t">
                   <p className="text-sm font-semibold">Gastos descontados del efectivo</p>
                   {registerSession.expenses.map((expense) => (
                     <div key={expense.id} className="flex justify-between gap-3 text-xs text-muted-foreground">
@@ -505,37 +749,47 @@ export default function CierreCaja() {
                       <span>-{formatCurrency(expense.amount, currencySymbol)}</span>
                     </div>
                   ))}
-                </div>}
+                </div>
+              )}
 
-                {registerSession.status === "open" ? <>
-                  {canAuthorizeExpenses && <form className="grid gap-2 rounded-lg border p-3 sm:grid-cols-[1fr_160px_auto]" onSubmit={(event) => { event.preventDefault(); void handleAuthorizeExpense(); }}>
-                    <label className="space-y-1 text-xs font-medium">
-                      Gasto autorizado
-                      <Input maxLength={300} required value={expenseDescription} onChange={(event) => setExpenseDescription(event.target.value)} placeholder="Descripción" />
-                    </label>
-                    <label className="space-y-1 text-xs font-medium">
-                      Monto
-                      <Input type="number" min="0.01" step="0.01" required value={expenseAmount} onChange={(event) => setExpenseAmount(event.target.value)} placeholder="0.00" />
-                    </label>
-                    <Button type="submit" variant="outline" disabled={cashActionLoading || !expenseDescription.trim() || !expenseAmount}>
-                      Registrar gasto
-                    </Button>
-                  </form>}
-                  <form className="flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-end" onSubmit={(event) => { event.preventDefault(); void handleCloseRegister(); }}>
-                    <label className="space-y-1.5 text-sm font-medium">
-                      Efectivo contado al cierre
-                      <Input type="number" min="0" step="0.01" required value={countedCash} onChange={(event) => setCountedCash(event.target.value)} placeholder="1050.00" />
-                    </label>
-                    <Button type="submit" variant="destructive" disabled={cashActionLoading || countedCash === ""}>
-                      <LockKeyhole className="mr-2 h-4 w-4" /> Cerrar caja y guardar diferencia
-                    </Button>
-                  </form>
-                </> : <div className="grid gap-3 rounded-lg border p-3 sm:grid-cols-3">
-                  <div><p className="text-xs text-muted-foreground">Efectivo esperado</p><p className="font-semibold">{formatCurrency(registerSession.expectedCash, currencySymbol)}</p></div>
-                  <div><p className="text-xs text-muted-foreground">Efectivo contado</p><p className="font-semibold">{formatCurrency(registerSession.countedCash ?? 0, currencySymbol)}</p></div>
-                  <div><p className="text-xs text-muted-foreground">Diferencia registrada</p><p className={`text-lg font-bold ${(registerSession.difference ?? 0) < 0 ? "text-destructive" : (registerSession.difference ?? 0) > 0 ? "text-amber-600" : "text-emerald-600"}`}>{formatCurrency(registerSession.difference ?? 0, currencySymbol)}</p></div>
-                </div>}
-              </>}
+              {!registerSession.isConsolidated && (
+                registerSession.status === "open" ? (
+                  <>
+                    {canAuthorizeExpenses && (
+                      <form className="grid gap-2 rounded-lg border p-3 sm:grid-cols-[1fr_160px_auto]" onSubmit={(event) => { event.preventDefault(); void handleAuthorizeExpense(); }}>
+                        <label className="space-y-1 text-xs font-medium">
+                          Gasto autorizado
+                          <Input maxLength={300} required value={expenseDescription} onChange={(event) => setExpenseDescription(event.target.value)} placeholder="Descripción" />
+                        </label>
+                        <label className="space-y-1 text-xs font-medium">
+                          Monto
+                          <Input type="number" min="0.01" step="0.01" required value={expenseAmount} onChange={(event) => setExpenseAmount(event.target.value)} placeholder="0.00" />
+                        </label>
+                        <Button type="submit" variant="outline" disabled={cashActionLoading || !expenseDescription.trim() || !expenseAmount}>
+                          Registrar gasto
+                        </Button>
+                      </form>
+                    )}
+                    <form className="flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-end" onSubmit={(event) => { event.preventDefault(); void handleCloseRegister(); }}>
+                      <label className="space-y-1.5 text-sm font-medium">
+                        Efectivo contado al cierre {isAdmin ? `(Caja de ${registerSession.userName})` : ""}
+                        <Input type="number" min="0" step="0.01" required value={countedCash} onChange={(event) => setCountedCash(event.target.value)} placeholder="1050.00" />
+                      </label>
+                      <Button type="submit" variant="destructive" disabled={cashActionLoading || countedCash === ""}>
+                        <LockKeyhole className="mr-2 h-4 w-4" /> Cerrar caja y guardar diferencia
+                      </Button>
+                    </form>
+                  </>
+                ) : (
+                  <div className="grid gap-3 rounded-lg border p-3 sm:grid-cols-3">
+                    <div><p className="text-xs text-muted-foreground">Efectivo esperado</p><p className="font-semibold">{formatCurrency(registerSession.expectedCash, currencySymbol)}</p></div>
+                    <div><p className="text-xs text-muted-foreground">Efectivo contado</p><p className="font-semibold">{formatCurrency(registerSession.countedCash ?? 0, currencySymbol)}</p></div>
+                    <div><p className="text-xs text-muted-foreground">Diferencia registrada</p><p className={`text-lg font-bold ${(registerSession.difference ?? 0) < 0 ? "text-destructive" : (registerSession.difference ?? 0) > 0 ? "text-amber-600" : "text-emerald-600"}`}>{formatCurrency(registerSession.difference ?? 0, currencySymbol)}</p></div>
+                  </div>
+                )
+              )}
+            </>
+          )}
         </CardContent>
       </Card>
 
@@ -550,12 +804,10 @@ export default function CierreCaja() {
                   Total Recaudado
                 </p>
                 <p className="text-2xl font-bold text-emerald-600">
-                  {formatCurrency(cierreData.grandTotal ?? (cierreData.totalCompleted + (registerSession?.totalDeposits || 0)), currencySymbol)}
+                  {formatCurrency(cierreData.grandTotal, currencySymbol)}
                 </p>
                 <p className="text-[10px] text-muted-foreground mt-0.5">
-                  {(registerSession?.totalDeposits && registerSession.totalDeposits > 0)
-                    ? `ventas (${formatCurrency(cierreData.totalCompleted, currencySymbol)}) + adelantos (${formatCurrency(registerSession.totalDeposits, currencySymbol)})`
-                    : "ventas completadas"}
+                  ventas ({formatCurrency(cierreData.totalDirectSales, currencySymbol)}) + adelantos ({formatCurrency(cierreData.totalDeposits, currencySymbol)}) + saldo ({formatCurrency(cierreData.totalReservationBalances, currencySymbol)})
                 </p>
               </div>
               <div className="w-9 h-9 rounded-xl bg-emerald-100 flex items-center justify-center">
@@ -574,12 +826,10 @@ export default function CierreCaja() {
                   Transacciones
                 </p>
                 <p className="text-2xl font-bold text-primary">
-                  {cierreData.countCompleted + (registerSession?.deposits?.length || 0)}
+                  {cierreData.countCompleted}
                 </p>
                 <p className="text-[10px] text-muted-foreground mt-0.5">
-                  {(registerSession?.deposits && registerSession.deposits.length > 0)
-                    ? `${cierreData.countCompleted} ventas · ${registerSession.deposits.length} adelanto(s)`
-                    : "completadas"}
+                  {`${cierreData.countDirectSales} ventas · ${cierreData.countReservationDeliveries} entregas · ${cierreData.countNewDeposits} adelantos`}
                 </p>
               </div>
               <div className="w-9 h-9 rounded-xl bg-primary/10 flex items-center justify-center">
@@ -595,7 +845,7 @@ export default function CierreCaja() {
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground mb-1">
-                  Promedio / Venta
+                  Promedio / Operación
                 </p>
                 <p className="text-2xl font-bold text-amber-600">
                   {formatCurrency(avg, currencySymbol)}
@@ -683,8 +933,8 @@ export default function CierreCaja() {
                           {formatCurrency(g.total, currencySymbol)}
                         </TableCell>
                         <TableCell className="text-right text-sm text-muted-foreground">
-                          {(cierreData.grandTotal ?? cierreData.totalCompleted) > 0
-                            ? `${((g.total / (cierreData.grandTotal ?? cierreData.totalCompleted)) * 100).toFixed(1)}%`
+                          {cierreData.grandTotal > 0
+                            ? `${((g.total / cierreData.grandTotal) * 100).toFixed(1)}%`
                             : "0%"}
                         </TableCell>
                       </TableRow>
@@ -693,23 +943,28 @@ export default function CierreCaja() {
                 </Table>
 
                 {/* Totals row */}
-                <div className="p-4 border-t bg-muted/10 flex justify-between items-center">
-                  <div className="text-xs text-muted-foreground space-y-0.5">
+                <div className="p-4 border-t bg-muted/10 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                  <div className="text-xs text-muted-foreground space-y-1">
                     <div className="flex items-center gap-3">
-                      <span>Ventas directas:</span>
-                      <span className="font-medium">{formatCurrency(cierreData.totalCompleted, currencySymbol)}</span>
+                      <span className="w-48 text-muted-foreground">Ventas directas:</span>
+                      <span className="font-semibold text-foreground">{formatCurrency(cierreData.totalDirectSales, currencySymbol)}</span>
                     </div>
-                    {Boolean(registerSession?.totalDeposits && registerSession.totalDeposits > 0) && (
-                      <div className="flex items-center gap-3">
-                        <span>Adelantos de reservas:</span>
-                        <span className="font-semibold text-emerald-700">+{formatCurrency(registerSession?.totalDeposits ?? 0, currencySymbol)}</span>
-                      </div>
-                    )}
+                    <div className="flex items-center gap-3">
+                      <span className="w-48 text-amber-800 dark:text-amber-300">Adelantos de reservas:</span>
+                      <span className="font-semibold text-amber-700 dark:text-amber-400">+{formatCurrency(cierreData.totalDeposits, currencySymbol)}</span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className="w-48 text-emerald-800 dark:text-emerald-300">Saldo a cobrar de reservas:</span>
+                      <span className="font-semibold text-emerald-700 dark:text-emerald-400">+{formatCurrency(cierreData.totalReservationBalances, currencySymbol)}</span>
+                    </div>
                   </div>
-                  <div className="text-right">
-                    <p className="text-xs text-muted-foreground font-medium uppercase tracking-wide">Total Recaudado</p>
+                  <div className="text-right sm:pl-4 border-t sm:border-t-0 sm:border-l pt-2 sm:pt-0 w-full sm:w-auto flex flex-col items-end">
+                    <p className="text-xs text-muted-foreground font-semibold uppercase tracking-wide">Total Recaudado</p>
                     <p className="text-2xl font-bold text-primary">
-                      {formatCurrency(cierreData.grandTotal ?? (cierreData.totalCompleted + (registerSession?.totalDeposits || 0)), currencySymbol)}
+                      {formatCurrency(cierreData.grandTotal, currencySymbol)}
+                    </p>
+                    <p className="text-[10px] text-muted-foreground mt-0.5">
+                      adelantos + saldo a cobrar + ventas
                     </p>
                   </div>
                 </div>
@@ -766,11 +1021,11 @@ export default function CierreCaja() {
                   <CardTitle className="text-sm font-semibold">
                     Detalle de Transacciones
                     <span className="ml-2 text-xs font-normal text-muted-foreground">
-                      ({filteredMovements.length} {transactionTab === "all" ? "totales" : transactionTab === "sales" ? "ventas" : "adelantos"})
+                      ({filteredMovements.length} {transactionTab === "all" ? "totales" : transactionTab === "sales" ? "ventas directas" : transactionTab === "deliveries" ? "entregas de reservas" : "adelantos"})
                     </span>
                   </CardTitle>
                 </div>
-                <div className="flex items-center gap-1 bg-muted/40 p-1 rounded-xl border text-xs">
+                <div className="flex items-center gap-1 bg-muted/40 p-1 rounded-xl border text-xs flex-wrap">
                   <button
                     type="button"
                     onClick={() => setTransactionTab("all")}
@@ -783,14 +1038,21 @@ export default function CierreCaja() {
                     onClick={() => setTransactionTab("sales")}
                     className={`px-2.5 py-1 rounded-lg transition-all font-medium ${transactionTab === "sales" ? "bg-white shadow-2xs text-primary font-bold" : "text-muted-foreground hover:text-foreground"}`}
                   >
-                    Ventas ({cierreData.sales.length})
+                    Ventas Directas ({cierreData.countDirectSales})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setTransactionTab("deliveries")}
+                    className={`px-2.5 py-1 rounded-lg transition-all font-medium ${transactionTab === "deliveries" ? "bg-white shadow-2xs text-emerald-700 font-bold" : "text-muted-foreground hover:text-foreground"}`}
+                  >
+                    Entregas Reservas ({cierreData.countReservationDeliveries})
                   </button>
                   <button
                     type="button"
                     onClick={() => setTransactionTab("deposits")}
                     className={`px-2.5 py-1 rounded-lg transition-all font-medium ${transactionTab === "deposits" ? "bg-white shadow-2xs text-amber-700 font-bold" : "text-muted-foreground hover:text-foreground"}`}
                   >
-                    Adelantos Reservas ({registerSession?.deposits?.length || 0})
+                    Adelantos ({cierreData.countNewDeposits})
                   </button>
                 </div>
               </div>
@@ -819,18 +1081,23 @@ export default function CierreCaja() {
                       </TableRow>
                     ) : (
                       filteredMovements.map((m) => {
+                        const isDelivery = m.type === "reservation_delivery";
                         const isSale = m.type === "sale";
                         const completed = isSale ? m.status === "completada" : true;
                         return (
                           <TableRow key={m.id} className={`hover:bg-muted/20 ${!completed ? "opacity-60" : ""}`}>
                             <TableCell className="font-mono text-sm font-medium">
                               <div className="flex items-center gap-1.5 flex-wrap">
-                                <span className={isSale ? "text-primary" : "text-amber-800 font-bold"}>
+                                <span className={isDelivery ? "text-emerald-800 font-bold" : isSale ? "text-primary" : "text-amber-800 font-bold"}>
                                   {m.docNumber}
                                 </span>
-                                {isSale ? (
+                                {isDelivery ? (
+                                  <Badge variant="outline" className="text-[10px] py-0 px-1 bg-emerald-50 text-emerald-800 border-emerald-300 font-semibold">
+                                    Entrega Reserva
+                                  </Badge>
+                                ) : isSale ? (
                                   <Badge variant="outline" className="text-[10px] py-0 px-1 bg-blue-50/60 text-blue-700 border-blue-200">
-                                    Venta
+                                    Venta Directa
                                   </Badge>
                                 ) : (
                                   <Badge variant="outline" className="text-[10px] py-0 px-1 bg-amber-50 text-amber-900 border-amber-200 font-medium">
@@ -857,13 +1124,24 @@ export default function CierreCaja() {
                               {m.paymentMethod}
                             </TableCell>
                             <TableCell className="text-right text-sm">
-                              {isSale ? (
+                              {isDelivery ? (
+                                <div>
+                                  <span className="font-bold text-emerald-700">
+                                    +{formatCurrency(m.amount, currencySymbol)}
+                                  </span>
+                                  {Boolean(m.secondaryAmount && m.secondaryAmount > m.amount) && (
+                                    <p className="text-[10px] text-muted-foreground">
+                                      Total: {formatCurrency(m.secondaryAmount ?? 0, currencySymbol)} · Adelanto: {formatCurrency((m.depositAmount ?? ((m.secondaryAmount ?? 0) - m.amount)), currencySymbol)}
+                                    </p>
+                                  )}
+                                </div>
+                              ) : isSale ? (
                                 <span className={`font-bold ${completed ? "text-foreground" : "text-muted-foreground line-through"}`}>
                                   {formatCurrency(m.amount, currencySymbol)}
                                 </span>
                               ) : (
                                 <div>
-                                  <span className="font-bold text-emerald-700">
+                                  <span className="font-bold text-amber-700">
                                     +{formatCurrency(m.amount, currencySymbol)}
                                   </span>
                                   {Boolean(m.secondaryAmount && m.secondaryAmount > m.amount) && (
@@ -875,7 +1153,14 @@ export default function CierreCaja() {
                               )}
                             </TableCell>
                             <TableCell className="text-center">
-                              {isSale ? (
+                              {isDelivery ? (
+                                <Badge
+                                  variant="outline"
+                                  className="text-[10px] border-emerald-300 bg-emerald-50 text-emerald-800 font-semibold"
+                                >
+                                  Entregada y Cobrada
+                                </Badge>
+                              ) : isSale ? (
                                 <Badge
                                   variant={completed ? "outline" : "destructive"}
                                   className={`text-[10px] ${completed ? "border-emerald-300 bg-emerald-50 text-emerald-700" : ""}`}
@@ -892,7 +1177,7 @@ export default function CierreCaja() {
                               )}
                             </TableCell>
                             <TableCell>
-                              <a href={m.link} title={isSale ? "Ver detalle de venta" : "Ver módulo de reservas"}>
+                              <a href={m.link} title={isDelivery ? "Ver reserva" : isSale ? "Ver detalle de venta" : "Ver módulo de reservas"}>
                                 <ArrowRight className="w-3.5 h-3.5 text-muted-foreground hover:text-primary transition-colors" />
                               </a>
                             </TableCell>

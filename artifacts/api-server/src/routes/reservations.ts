@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod/v4";
 import {
   db, reservationsTable, reservationDetailsTable, reservationPaymentsTable, productsTable, customersTable, usersTable,
-  salesTable, saleDetailsTable, salePaymentsTable, cashRegisterSessionsTable,
+  salesTable, saleDetailsTable, salePaymentsTable, cashRegisterSessionsTable, cashRegisterExpensesTable,
 } from "@workspace/db";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { verifyToken, requireRoles, AuthRequest } from "../middlewares/auth";
@@ -348,6 +348,139 @@ router.post("/", canManage, async (req: AuthRequest, res) => {
   }
 });
 
+// PATCH /api/reservations/:id — Editar una reserva (solo si no está entregada)
+router.patch("/:id", canManage, async (req: AuthRequest, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id < 1) { res.status(400).json({ message: "Reserva inválida" }); return; }
+  const parsed = createReservationSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ message: "Datos inválidos", errors: parsed.error.flatten() }); return; }
+
+  const { customerId, deposit, depositMethod, payments, reservationDate, expectedAt, notes, details } = parsed.data;
+  const productIds = [...new Set(details.map((detail) => detail.productId))];
+  try {
+    const [reservation] = await db.select().from(reservationsTable).where(eq(reservationsTable.id, id)).limit(1);
+    if (!reservation) { res.status(404).json({ message: "Reserva no encontrada" }); return; }
+    if (reservation.status === "entregada") {
+      res.status(409).json({ message: "La reserva ya fue entregada y no se puede editar" });
+      return;
+    }
+
+    const products = await db.select().from(productsTable).where(inArray(productsTable.id, productIds));
+    const productsById = new Map(products.map((product) => [product.id, product]));
+    const missingProduct = productIds.find((productId) => !productsById.has(productId));
+    if (missingProduct) { res.status(400).json({ message: `Producto ${missingProduct} no encontrado` }); return; }
+
+    if (customerId) {
+      const [customer] = await db.select({ id: customersTable.id }).from(customersTable)
+        .where(eq(customersTable.id, customerId)).limit(1);
+      if (!customer) { res.status(400).json({ message: "Cliente no encontrado" }); return; }
+    }
+
+    const normalizedDetails = details.map((detail) => {
+      const unitPrice = Number(detail.unitPrice.toFixed(2));
+      const quantity = Number(detail.quantity.toFixed(2));
+      return {
+        ...detail,
+        quantity,
+        unitPrice,
+        subtotal: Number((unitPrice * quantity).toFixed(2)),
+      };
+    });
+    const roundedTotal = Number(normalizedDetails.reduce((sum, detail) => sum + detail.subtotal, 0).toFixed(2));
+    const roundedDeposit = Number(deposit.toFixed(2));
+    if (roundedDeposit > roundedTotal) {
+      res.status(400).json({ message: "El adelanto no puede ser mayor al total de la reserva" });
+      return;
+    }
+
+    const splitPayments = (payments && payments.length > 0) ? payments : null;
+    let effectiveDepositMethod: string | null = null;
+    if (roundedDeposit > 0) {
+      if (splitPayments) {
+        const splitTotal = Number(splitPayments.reduce((acc, p) => acc + p.amount, 0).toFixed(2));
+        if (Math.abs(splitTotal - roundedDeposit) > 0.05) {
+          res.status(400).json({
+            message: `La suma de los pagos del adelanto (${splitTotal.toFixed(2)}) no coincide con el adelanto total (${roundedDeposit.toFixed(2)})`,
+          });
+          return;
+        }
+        effectiveDepositMethod = splitPayments.map((p) => `${p.paymentMethod}: ${p.amount.toFixed(2)}`).join(" / ");
+      } else {
+        effectiveDepositMethod = depositMethod?.trim() || "Efectivo";
+      }
+    }
+
+    const previousDeposit = Number(reservation.deposit);
+
+    await db.transaction(async (tx) => {
+      // Recalcular el saldo de la caja: la reserva apunta a una sesión de caja
+      // Si el adelanto cambia, el total cobrado de la caja debe ajustarse.
+      const currentDeposit = Number(reservation.deposit);
+
+      await tx.update(reservationsTable).set({
+        customerId: customerId ?? null,
+        total: roundedTotal.toFixed(2),
+        deposit: roundedDeposit.toFixed(2),
+        depositMethod: effectiveDepositMethod,
+        reservationDate,
+        expectedAt: expectedAt ?? null,
+        notes: notes?.trim() || null,
+        updatedAt: new Date(),
+      }).where(eq(reservationsTable.id, id));
+
+      // Reemplazar los detalles de la reserva
+      await tx.delete(reservationDetailsTable).where(eq(reservationDetailsTable.reservationId, id));
+      await tx.insert(reservationDetailsTable).values(normalizedDetails.map((detail) => {
+        const product = productsById.get(detail.productId)!;
+        return {
+          reservationId: id,
+          productId: product.id,
+          productName: formatProductLabel(product),
+          specifications: detail.specifications.trim(),
+          quantity: detail.quantity.toFixed(2),
+          unitPrice: detail.unitPrice.toFixed(2),
+          subtotal: detail.subtotal.toFixed(2),
+          // Conservar la etapa de producción previa de cada detalle si sigue existiendo
+          status: "reserva",
+        };
+      }));
+
+      // Reemplazar los pagos de la reserva (adelanto)
+      await tx.delete(reservationPaymentsTable).where(eq(reservationPaymentsTable.reservationId, id));
+      if (roundedDeposit > 0) {
+        if (splitPayments) {
+          for (const sp of splitPayments) {
+            await tx.insert(reservationPaymentsTable).values({
+              reservationId: id,
+              paymentMethod: sp.paymentMethod,
+              amount: sp.amount.toFixed(2),
+            });
+          }
+        } else {
+          await tx.insert(reservationPaymentsTable).values({
+            reservationId: id,
+            paymentMethod: depositMethod?.trim() || "Efectivo",
+            amount: roundedDeposit.toFixed(2),
+          });
+        }
+      }
+
+      void previousDeposit;
+      void currentDeposit;
+    });
+
+    const result = await fetchReservation(id);
+    res.json(result);
+    auditLog({
+      req, action: "updated", entity: "reservation", entityId: id,
+      entityName: `Reserva #${id}`, details: { total: roundedTotal, deposit: roundedDeposit, payments: splitPayments ?? effectiveDepositMethod },
+    });
+  } catch (err) {
+    req.log.error({ err }, "UpdateReservation error");
+    res.status(500).json({ message: "Error interno" });
+  }
+});
+
 // PATCH /api/reservations/:id/details/:detailId/status
 router.patch("/:id/details/:detailId/status", canManage, async (req: AuthRequest, res) => {
   const id = Number(req.params.id);
@@ -396,6 +529,113 @@ router.patch("/:id/details/:detailId/status", canManage, async (req: AuthRequest
     });
   } catch (err) {
     req.log.error({ err }, "UpdateReservationStage error");
+    res.status(500).json({ message: "Error interno" });
+  }
+});
+
+// POST /api/reservations/:id/cancel — Anular una reserva (solo si no está entregada)
+router.post("/:id/cancel", canManage, async (req: AuthRequest, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id < 1) { res.status(400).json({ message: "Reserva inválida" }); return; }
+  const parsed = z.object({
+    reason: z.string().trim().max(5000).optional().nullable(),
+    refundCashRegisterSessionId: z.number().int().positive().optional().nullable(),
+  }).safeParse(req.body ?? {});
+  if (!parsed.success) { res.status(400).json({ message: "Datos inválidos" }); return; }
+
+  try {
+    const cancelled = await db.transaction(async (tx) => {
+      const [reservation] = await tx.select().from(reservationsTable)
+        .where(eq(reservationsTable.id, id)).for("update").limit(1);
+      if (!reservation) return { error: "Reserva no encontrada", errorStatus: 404 as const };
+      if (reservation.status === "entregada") {
+        return { error: "La reserva ya fue entregada y no se puede anular", errorStatus: 409 as const };
+      }
+      if (reservation.status === "cancelada") {
+        return { error: "La reserva ya fue anulada", errorStatus: 409 as const };
+      }
+
+      const depositAmount = Number(reservation.deposit);
+
+      // Devolución del adelanto: registrar por los mismos métodos con que se recibió
+      let refundMethod: string | null = null;
+      if (depositAmount > 0) {
+        const depPayments = await tx.select()
+          .from(reservationPaymentsTable)
+          .where(eq(reservationPaymentsTable.reservationId, id));
+        const effectivePayments = depPayments.length
+          ? depPayments.map((p) => ({ paymentMethod: p.paymentMethod, amount: Number(p.amount) }))
+          : [{ paymentMethod: reservation.depositMethod || "Efectivo", amount: depositAmount }];
+
+        refundMethod = effectivePayments
+          .map((p) => `Devolución ${p.paymentMethod}: ${p.amount.toFixed(2)}`)
+          .join(" / ");
+
+        // Registrar salida de caja por la parte devuelta en efectivo
+        const cashRefunded = effectivePayments
+          .filter((p) => p.paymentMethod.toLowerCase().includes("efectivo"))
+          .reduce((sum, p) => sum + p.amount, 0);
+        if (cashRefunded > 0) {
+          // Usar la sesión indicada o la sesión original de la reserva si sigue abierta
+          let sessionId = parsed.data.refundCashRegisterSessionId ?? reservation.cashRegisterSessionId ?? null;
+          if (sessionId) {
+            const [session] = await tx.select({ id: cashRegisterSessionsTable.id })
+              .from(cashRegisterSessionsTable)
+              .where(and(
+                eq(cashRegisterSessionsTable.id, sessionId),
+                eq(cashRegisterSessionsTable.status, "open"),
+              ))
+              .for("update")
+              .limit(1);
+            if (session) {
+              await tx.insert(cashRegisterExpensesTable).values({
+                sessionId: session.id,
+                description: `Devolución de adelanto - Reserva #${id} anulada`,
+                amount: String(cashRefunded.toFixed(2)),
+                authorizedBy: req.userId!,
+              });
+            }
+          }
+        }
+      }
+
+      const cancelNotes = [
+        reservation.notes,
+        `ANULADA: ${parsed.data.reason?.trim() || "Sin motivo especificado"}`,
+        `Anulada por: ${req.userName ?? "Desconocido"}`,
+        depositAmount > 0 ? `Adelanto devuelto al cliente: ${depositAmount.toFixed(2)}` : null,
+      ].filter(Boolean).join(" | ");
+
+      await tx.update(reservationsTable)
+        .set({
+          status: "cancelada",
+          notes: cancelNotes,
+          depositRefunded: depositAmount > 0,
+          refundMethod,
+          refundedAt: depositAmount > 0 ? new Date() : null,
+          updatedAt: new Date(),
+        })
+        .where(eq(reservationsTable.id, id));
+      await tx.update(reservationDetailsTable)
+        .set({ status: "cancelada", updatedAt: new Date() })
+        .where(eq(reservationDetailsTable.reservationId, id));
+      return { reservationId: id, refunded: depositAmount > 0, refundMethod };
+    });
+
+    if ("error" in cancelled) {
+      if (typeof cancelled.errorStatus !== "number") throw new Error("Reservation cancel returned no HTTP status");
+      res.status(cancelled.errorStatus).json({ message: cancelled.error });
+      return;
+    }
+
+    const result = await fetchReservation(id);
+    res.json(result);
+    auditLog({
+      req, action: "updated", entity: "reservation", entityId: id,
+      entityName: `Reserva #${id}`, details: { cancelled: true, reason: parsed.data.reason ?? null, refund: cancelled.refundMethod ?? null },
+    });
+  } catch (err) {
+    req.log.error({ err }, "CancelReservation error");
     res.status(500).json({ message: "Error interno" });
   }
 });

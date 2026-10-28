@@ -1,4 +1,4 @@
-import { pgTable, serial, integer, numeric, varchar, text, timestamp, date, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, serial, integer, numeric, varchar, text, timestamp, date, boolean, uniqueIndex } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 import { customersTable } from "./customers";
@@ -78,6 +78,9 @@ export const reservationsTable = pgTable("reservations", {
   expectedAt: date("expected_at"),
   notes: text("notes"),
   saleId: integer("sale_id").references(() => salesTable.id, { onDelete: "set null" }),
+  depositRefunded: boolean("deposit_refunded").notNull().default(false),
+  refundMethod: varchar("refund_method", { length: 255 }),
+  refundedAt: timestamp("refunded_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => new Date()),
 });

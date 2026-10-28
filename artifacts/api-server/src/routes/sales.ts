@@ -3,7 +3,8 @@ import {
   db, salesTable, saleDetailsTable, productsTable,
   customersTable, usersTable, businessSettingsTable,
   customerPointsTable, pointsTransactionsTable, getTierForLifetime,
-  cashRegisterSessionsTable, salePaymentsTable,
+  cashRegisterSessionsTable, salePaymentsTable, cashRegisterExpensesTable,
+  reservationsTable, reservationPaymentsTable, reservationDetailsTable,
 } from "@workspace/db";
 import { eq, gte, lte, and, sql, inArray } from "drizzle-orm";
 import { CreateSaleBody } from "@workspace/api-zod";
@@ -32,19 +33,61 @@ function formatSale(
   userName?: string | null,
   customerNitCi?: string | null,
   customerPhone?: string | null,
-  payments?: Array<{ paymentMethod: string; amount: number }>
+  payments?: Array<{ paymentMethod: string; amount: number }>,
+  resvInfo?: {
+    reservationId?: number | null;
+    deposit?: number | null;
+    depositMethod?: string | null;
+    depositPayments?: Array<{ paymentMethod: string; amount: number }>;
+  } | null
 ) {
+  let isReservationDelivery = Boolean(resvInfo?.reservationId);
+  let reservationId = resvInfo?.reservationId ?? null;
+  let reservationDeposit = resvInfo?.deposit ?? null;
+  let reservationDepositMethod = resvInfo?.depositMethod ?? null;
+  let reservationDepositPayments = resvInfo?.depositPayments;
+
+  if (!isReservationDelivery && s.notes) {
+    const match = s.notes.match(/Entrega de reserva #(\d+)/);
+    if (match) {
+      isReservationDelivery = true;
+      reservationId = Number(match[1]);
+      const depMatch = s.notes.match(/Adelanto recibido previamente:\s*([0-9.]+)/);
+      if (depMatch) {
+        reservationDeposit = Number(depMatch[1]);
+      }
+    }
+  }
+
+  let reservationBalance: number | null = null;
+  if (isReservationDelivery) {
+    if (s.amountPaid !== null && s.amountPaid !== undefined) {
+      reservationBalance = Number(s.amountPaid);
+    } else if (reservationDeposit !== null) {
+      reservationBalance = Math.max(0, Number(s.total) - reservationDeposit);
+    } else {
+      reservationBalance = Number(s.total);
+    }
+  }
+
   return {
     id: s.id, customerId: s.customerId ?? null, customerName: customerName ?? null,
     customerNitCi: customerNitCi ?? null, customerPhone: customerPhone ?? null,
     userId: s.userId ?? null, userName: userName ?? null,
     subtotal: Number(s.subtotal), iva: Number(s.iva), total: Number(s.total),
+    discount: Number(s.discount ?? 0),
     paymentMethod: s.paymentMethod,
     payments: payments?.length ? payments : undefined,
     amountPaid: s.amountPaid !== null && s.amountPaid !== undefined ? Number(s.amountPaid) : null,
     changeDue: s.changeDue !== null && s.changeDue !== undefined ? Number(s.changeDue) : null,
     status: s.status, notes: s.notes ?? null,
     createdAt: s.createdAt instanceof Date ? s.createdAt.toISOString() : s.createdAt,
+    isReservationDelivery,
+    reservationId,
+    reservationDeposit: reservationDeposit !== null ? Number(reservationDeposit) : null,
+    reservationDepositMethod,
+    reservationDepositPayments,
+    reservationBalance,
   };
 }
 
@@ -64,6 +107,21 @@ async function getSalePayments(saleIds: number[]) {
 router.get("/", async (req: AuthRequest, res) => {
   const { dateFrom, dateTo, customerId, userId } = req.query as any;
   try {
+    let startCondition = undefined;
+    let endCondition = undefined;
+    if (dateFrom) {
+      const fromDate = /^\d{4}-\d{2}-\d{2}$/.test(dateFrom)
+        ? new Date(`${dateFrom}T00:00:00-04:00`)
+        : new Date(dateFrom);
+      startCondition = gte(salesTable.createdAt, fromDate);
+    }
+    if (dateTo) {
+      const toDate = /^\d{4}-\d{2}-\d{2}$/.test(dateTo)
+        ? new Date(`${dateTo}T23:59:59.999-04:00`)
+        : new Date(new Date(dateTo).getTime() + 86399999);
+      endCondition = lte(salesTable.createdAt, toDate);
+    }
+
     const rows = await db
       .select({
         sale: salesTable,
@@ -71,14 +129,18 @@ router.get("/", async (req: AuthRequest, res) => {
         customerNitCi: customersTable.nitCi,
         customerPhone: customersTable.phone,
         userName: usersTable.name,
+        reservationId: reservationsTable.id,
+        reservationDeposit: reservationsTable.deposit,
+        reservationDepositMethod: reservationsTable.depositMethod,
       })
       .from(salesTable)
       .leftJoin(customersTable, eq(salesTable.customerId, customersTable.id))
       .leftJoin(usersTable, eq(salesTable.userId, usersTable.id))
+      .leftJoin(reservationsTable, eq(reservationsTable.saleId, salesTable.id))
       .where(
         and(
-          dateFrom ? gte(salesTable.createdAt, new Date(dateFrom)) : undefined,
-          dateTo ? lte(salesTable.createdAt, new Date(new Date(dateTo).getTime() + 86399999)) : undefined,
+          startCondition,
+          endCondition,
           customerId ? eq(salesTable.customerId, Number(customerId)) : undefined,
           userId ? eq(salesTable.userId, Number(userId)) : undefined,
         )
@@ -86,7 +148,36 @@ router.get("/", async (req: AuthRequest, res) => {
       .orderBy(sql`${salesTable.createdAt} DESC`);
 
     const paymentMap = await getSalePayments(rows.map(({ sale }) => sale.id));
-    res.json(rows.map(r => formatSale(r.sale, r.customerName, r.userName, r.customerNitCi, r.customerPhone, paymentMap.get(r.sale.id))));
+
+    const resvIds = rows
+      .map((r) => r.reservationId)
+      .filter((id): id is number => id !== null && id !== undefined);
+
+    const resvPayments = resvIds.length > 0
+      ? await db.select().from(reservationPaymentsTable).where(inArray(reservationPaymentsTable.reservationId, resvIds))
+      : [];
+
+    const resvPaymentMap = new Map<number, Array<{ paymentMethod: string; amount: number }>>();
+    for (const rp of resvPayments) {
+      const list = resvPaymentMap.get(rp.reservationId) ?? [];
+      list.push({ paymentMethod: rp.paymentMethod, amount: Number(rp.amount) });
+      resvPaymentMap.set(rp.reservationId, list);
+    }
+
+    res.json(rows.map(r => formatSale(
+      r.sale,
+      r.customerName,
+      r.userName,
+      r.customerNitCi,
+      r.customerPhone,
+      paymentMap.get(r.sale.id),
+      r.reservationId ? {
+        reservationId: r.reservationId,
+        deposit: r.reservationDeposit ? Number(r.reservationDeposit) : 0,
+        depositMethod: r.reservationDepositMethod,
+        depositPayments: resvPaymentMap.get(r.reservationId),
+      } : null
+    )));
   } catch (err) {
     req.log.error({ err }, "GetSales error");
     res.status(500).json({ message: "Error interno" });
@@ -251,10 +342,14 @@ router.get("/:id", async (req, res) => {
         customerNitCi: customersTable.nitCi,
         customerPhone: customersTable.phone,
         userName: usersTable.name,
+        reservationId: reservationsTable.id,
+        reservationDeposit: reservationsTable.deposit,
+        reservationDepositMethod: reservationsTable.depositMethod,
       })
       .from(salesTable)
       .leftJoin(customersTable, eq(salesTable.customerId, customersTable.id))
       .leftJoin(usersTable, eq(salesTable.userId, usersTable.id))
+      .leftJoin(reservationsTable, eq(reservationsTable.saleId, salesTable.id))
       .where(eq(salesTable.id, id))
       .limit(1);
 
@@ -277,9 +372,33 @@ router.get("/:id", async (req, res) => {
       pointsEarned = tx?.delta ?? 0;
     }
 
+    let depositPayments: Array<{ paymentMethod: string; amount: number }> | undefined = undefined;
+    if (row.reservationId) {
+      const rpRows = await db
+        .select()
+        .from(reservationPaymentsTable)
+        .where(eq(reservationPaymentsTable.reservationId, row.reservationId));
+      if (rpRows.length > 0) {
+        depositPayments = rpRows.map((rp) => ({ paymentMethod: rp.paymentMethod, amount: Number(rp.amount) }));
+      }
+    }
+
     const paymentMap = await getSalePayments([id]);
     res.json({
-      ...formatSale(row.sale, row.customerName, row.userName, row.customerNitCi, row.customerPhone, paymentMap.get(id)),
+      ...formatSale(
+        row.sale,
+        row.customerName,
+        row.userName,
+        row.customerNitCi,
+        row.customerPhone,
+        paymentMap.get(id),
+        row.reservationId ? {
+          reservationId: row.reservationId,
+          deposit: row.reservationDeposit ? Number(row.reservationDeposit) : 0,
+          depositMethod: row.reservationDepositMethod,
+          depositPayments,
+        } : null
+      ),
       pointsEarned,
       details: details.map(d => ({
         id: d.id, productId: d.productId ?? null, productName: d.productName,
@@ -352,6 +471,68 @@ router.post("/:id/cancel", requireAdmin, async (req: AuthRequest, res) => {
             .set({ stock: sql`${productsTable.stock} + ${Number(d.quantity)}` })
             .where(eq(productsTable.id, d.productId));
         }
+      }
+
+      // Si la venta anulada es una entrega de reserva, liberar la reserva y devolver el adelanto
+      const [linkedReservation] = await tx.select().from(reservationsTable)
+        .where(eq(reservationsTable.saleId, id)).for("update").limit(1);
+      if (linkedReservation) {
+        const depAmount = Number(linkedReservation.deposit);
+
+        // Determinar métodos de pago con que se recibió el adelanto
+        let refundMethod: string | null = null;
+        let cashRefunded = 0;
+        if (depAmount > 0) {
+          const depPayments = await tx.select()
+            .from(reservationPaymentsTable)
+            .where(eq(reservationPaymentsTable.reservationId, linkedReservation.id));
+          const effectivePayments = depPayments.length
+            ? depPayments.map((p) => ({ paymentMethod: p.paymentMethod, amount: Number(p.amount) }))
+            : [{ paymentMethod: linkedReservation.depositMethod || "Efectivo", amount: depAmount }];
+
+          refundMethod = effectivePayments
+            .map((p) => `Devolución ${p.paymentMethod}: ${p.amount.toFixed(2)}`)
+            .join(" / ");
+
+          cashRefunded = effectivePayments
+            .filter((p) => p.paymentMethod.toLowerCase().includes("efectivo"))
+            .reduce((sum, p) => sum + p.amount, 0);
+
+          // Registrar salida de caja por la parte del adelanto devuelta en efectivo
+          if (cashRefunded > 0 && sale.cashRegisterSessionId) {
+            const [session] = await tx.select({ id: cashRegisterSessionsTable.id, status: cashRegisterSessionsTable.status })
+              .from(cashRegisterSessionsTable)
+              .where(eq(cashRegisterSessionsTable.id, sale.cashRegisterSessionId))
+              .for("update")
+              .limit(1);
+            if (session && session.status === "open") {
+              await tx.insert(cashRegisterExpensesTable).values({
+                sessionId: session.id,
+                description: `Devolución de adelanto - Reserva #${linkedReservation.id} (venta #${id} anulada)`,
+                amount: String(cashRefunded.toFixed(2)),
+                authorizedBy: req.userId!,
+              });
+            }
+          }
+        }
+
+        const resvNotes = [
+          linkedReservation.notes,
+          `ADELANTO DEVUELTO: Venta #${id} anulada el ${new Date().toLocaleDateString("es-BO")}${refundMethod ? ` (${refundMethod})` : ""}`,
+        ].filter(Boolean).join(" | ");
+
+        await tx.update(reservationsTable).set({
+          saleId: null,
+          status: "listo_entrega",
+          notes: resvNotes,
+          depositRefunded: depAmount > 0,
+          refundMethod,
+          refundedAt: depAmount > 0 ? new Date() : null,
+          updatedAt: new Date(),
+        }).where(eq(reservationsTable.id, linkedReservation.id));
+        await tx.update(reservationDetailsTable)
+          .set({ status: "listo_entrega", updatedAt: new Date() })
+          .where(eq(reservationDetailsTable.reservationId, linkedReservation.id));
       }
 
       if (sale.customerId) {
