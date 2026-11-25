@@ -206,8 +206,11 @@ export default function POS() {
     status: "open" | "closed";
     businessDate: string;
   } | null>({
-    queryKey: ["/api/cash-register", businessDate],
-    queryFn: () => customFetch(`/api/cash-register?date=${businessDate}`),
+    queryKey: ["/api/cash-register", businessDate, user?.id],
+    queryFn: () => customFetch(
+      `/api/cash-register?date=${businessDate}${user?.role === "admin" && user.id ? `&userId=${user.id}` : ""}`,
+    ),
+    enabled: user?.role !== "admin" || Boolean(user?.id),
     refetchInterval: 15000,
   });
   const { data: settings } = useGetBusinessSettings();

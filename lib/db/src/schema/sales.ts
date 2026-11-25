@@ -90,6 +90,7 @@ export const reservationPaymentsTable = pgTable("reservation_payments", {
   reservationId: integer("reservation_id").notNull().references(() => reservationsTable.id, { onDelete: "cascade" }),
   paymentMethod: varchar("payment_method", { length: 100 }).notNull(),
   amount: numeric("amount", { precision: 12, scale: 2 }).notNull(),
+  cashRegisterSessionId: integer("cash_register_session_id").references(() => cashRegisterSessionsTable.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

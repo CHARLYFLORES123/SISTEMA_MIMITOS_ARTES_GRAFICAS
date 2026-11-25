@@ -20,6 +20,7 @@ type ReservationStage = "reserva" | "produccion" | "listo_entrega";
 type ReservationPaymentItem = {
   paymentMethod: string;
   amount: number;
+  createdAt: string;
 };
 type ReservationDetail = {
   id: number;
@@ -75,8 +76,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export default function Reservations() {
-  const { role } = usePermissions();
+  const { role, can, user } = usePermissions();
   const isDesigner = role === "diseñador";
+  const canCancelReservation = can("reservations", "cancel");
   const queryClient = useQueryClient();
   const { currencySymbol } = useCurrency();
   const { data: settings } = useGetBusinessSettings();
@@ -84,6 +86,10 @@ export default function Reservations() {
   const { data: products } = useGetProducts();
   const { data: rawPaymentMethods } = useGetPaymentMethods();
   const [actionLoadingId, setActionLoadingId] = useState<number | null>(null);
+  const [advancingReservation, setAdvancingReservation] = useState<Reservation | null>(null);
+  const [advanceAmount, setAdvanceAmount] = useState("");
+  const [advanceMethod, setAdvanceMethod] = useState("Efectivo");
+  const [advanceSaving, setAdvanceSaving] = useState(false);
 
   const businessSettingsForTicket = useMemo(() => ({
     companyName: settings?.companyName || "MIMITOS ARTES GRÁFICAS",
@@ -159,8 +165,11 @@ export default function Reservations() {
     queryFn: () => request<Reservation[]>("/api/reservations"),
   });
   const { data: activeCashRegister } = useQuery<{ id: number; status: string } | null>({
-    queryKey: ["/api/cash-register", localDate()],
-    queryFn: () => request<{ id: number; status: string } | null>(`/api/cash-register?date=${localDate()}`),
+    queryKey: ["/api/cash-register", localDate(), user?.id],
+    queryFn: () => request<{ id: number; status: string } | null>(
+      `/api/cash-register?date=${localDate()}${role === "admin" && user?.id ? `&userId=${user.id}` : ""}`,
+    ),
+    enabled: role !== "admin" || Boolean(user?.id),
   });
   const [customerId, setCustomerId] = useState("none");
   const [customerOpen, setCustomerOpen] = useState(false);
@@ -200,12 +209,6 @@ export default function Reservations() {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editSaving, setEditSaving] = useState(false);
   const [editCustomerId, setEditCustomerId] = useState("none");
-  const [editDeposit, setEditDeposit] = useState("0");
-  const [editIsMixedDeposit, setEditIsMixedDeposit] = useState(false);
-  const [editMixedPayments, setEditMixedPayments] = useState<Array<{ method: string; amount: string }>>([
-    { method: "Efectivo", amount: "" },
-    { method: "Transferencia", amount: "" },
-  ]);
   const [editReservationDate, setEditReservationDate] = useState(localDate());
   const [editExpectedAt, setEditExpectedAt] = useState("");
   const [editNotes, setEditNotes] = useState("");
@@ -214,6 +217,7 @@ export default function Reservations() {
   const [filterPhone, setFilterPhone] = useState("");
   const [filterDate, setFilterDate] = useState("");
   const [filterExpectedDate, setFilterExpectedDate] = useState("");
+  const [filterStatus, setFilterStatus] = useState<ReservationStage | "all">("all");
 
   const mixedTotal = useMemo(() => {
     return mixedPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
@@ -365,27 +369,6 @@ export default function Reservations() {
   const openEditDialog = (reservation: Reservation) => {
     setEditingId(reservation.id);
     setEditCustomerId(reservation.customerId ? String(reservation.customerId) : "none");
-    setEditDeposit(String(reservation.deposit));
-    // Detectar si la reserva fue creada con pago dividido (mixto)
-    const resvPayments = reservation.payments ?? [];
-    const activeSplit = resvPayments.filter((p) => (Number(p.amount) || 0) > 0);
-    const wasSplit = activeSplit.length > 1 ||
-      (activeSplit.length === 1 && reservation.depositMethod && reservation.depositMethod.includes("/"));
-    setEditIsMixedDeposit(Boolean(wasSplit));
-    if (wasSplit) {
-      // Precargar los métodos con sus montos, agregando al menos dos filas
-      const rows = activeSplit.map((p) => ({ method: p.paymentMethod, amount: String(p.amount) }));
-      while (rows.length < 2) {
-        const unused = availablePaymentMethods.find((m) => !rows.some((r) => r.method === m)) || "Transferencia";
-        rows.push({ method: unused, amount: "" });
-      }
-      setEditMixedPayments(rows);
-    } else {
-      setEditMixedPayments([
-        { method: "Efectivo", amount: "" },
-        { method: "Transferencia", amount: "" },
-      ]);
-    }
     setEditReservationDate(reservation.reservationDate);
     setEditExpectedAt(reservation.expectedAt ? reservation.expectedAt.slice(0, 10) : "");
     setEditNotes(reservation.notes ?? "");
@@ -396,12 +379,6 @@ export default function Reservations() {
       specifications: detail.specifications,
     })));
   };
-
-  const editMixedTotal = useMemo(() => {
-    return editMixedPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
-  }, [editMixedPayments]);
-
-  const editEffectiveDeposit = editIsMixedDeposit ? editMixedTotal : (Number(editDeposit) || 0);
 
   const editTotal = useMemo(() => editDetails.reduce((sum, detail) => {
     return sum + (Number(detail.quantity) || 0) * (Number(detail.unitPrice) || 0);
@@ -424,35 +401,10 @@ export default function Reservations() {
       Toast.fire({ icon: "error", title: "Completa los productos y sus detalles (la cantidad debe ser mayor a 0)" });
       return;
     }
-    const depositAmount = editEffectiveDeposit;
-    if (!Number.isFinite(depositAmount) || depositAmount < 0 || depositAmount > editTotal) {
-      Toast.fire({ icon: "error", title: "El adelanto debe estar entre 0 y el total de la reserva" });
+    const paidSoFar = reservations?.find((reservation) => reservation.id === editingId)?.deposit ?? 0;
+    if (paidSoFar > editTotal) {
+      Toast.fire({ icon: "error", title: "El total no puede ser menor que los adelantos ya recibidos" });
       return;
-    }
-
-    let finalEditDepositMethod: string | null = null;
-    let finalEditPayments: Array<{ paymentMethod: string; amount: number }> | undefined = undefined;
-
-    if (depositAmount > 0) {
-      if (editIsMixedDeposit) {
-        const activeMixed = editMixedPayments
-          .filter((p) => (Number(p.amount) || 0) > 0)
-          .map((p) => ({ paymentMethod: p.method, amount: Number(Number(p.amount).toFixed(2)) }));
-        if (activeMixed.length === 0) {
-          Toast.fire({ icon: "warning", title: "Ingresa los montos para el pago mixto del adelanto" });
-          return;
-        }
-        const activeSum = Number(activeMixed.reduce((s, p) => s + p.amount, 0).toFixed(2));
-        if (Math.abs(activeSum - depositAmount) > 0.05) {
-          Toast.fire({ icon: "warning", title: "La suma de los montos no coincide con el total del adelanto" });
-          return;
-        }
-        finalEditPayments = activeMixed;
-        finalEditDepositMethod = activeMixed.map((p) => `${p.paymentMethod}: ${p.amount.toFixed(2)}`).join(" / ");
-      } else {
-        finalEditDepositMethod = "Efectivo";
-        finalEditPayments = [{ paymentMethod: finalEditDepositMethod, amount: depositAmount }];
-      }
     }
 
     setEditSaving(true);
@@ -461,9 +413,6 @@ export default function Reservations() {
         method: "PATCH",
         body: JSON.stringify({
           customerId: editCustomerId === "none" ? null : Number(editCustomerId),
-          deposit: depositAmount,
-          depositMethod: finalEditDepositMethod,
-          payments: finalEditPayments,
           reservationDate: editReservationDate,
           expectedAt: editExpectedAt || null,
           notes: editNotes.trim() || null,
@@ -477,6 +426,43 @@ export default function Reservations() {
       Toast.fire({ icon: "error", title: "No se pudo actualizar la reserva", text: error instanceof Error ? error.message : "Error inesperado" });
     } finally {
       setEditSaving(false);
+    }
+  };
+
+  const recordAdvance = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!advancingReservation) return;
+    const amount = Number(advanceAmount);
+    if (!Number.isFinite(amount) || amount <= 0 || amount > advancingReservation.balance) {
+      Toast.fire({ icon: "error", title: "El abono debe ser mayor a cero y no superar el saldo pendiente" });
+      return;
+    }
+    if (activeCashRegister?.status !== "open") {
+      Toast.fire({ icon: "warning", title: "Abre la caja del día antes de registrar un abono" });
+      return;
+    }
+
+    setAdvanceSaving(true);
+    try {
+      await request<Reservation>(`/api/reservations/${advancingReservation.id}/payments`, {
+        method: "POST",
+        body: JSON.stringify({
+          amount,
+          paymentMethod: advanceMethod,
+          cashRegisterSessionId: activeCashRegister.id,
+        }),
+      });
+      setAdvancingReservation(null);
+      setAdvanceAmount("");
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["/api/reservations"] }),
+        queryClient.invalidateQueries({ queryKey: ["/api/cash-register"] }),
+      ]);
+      Toast.fire({ icon: "success", title: "Abono registrado en la caja de hoy" });
+    } catch (error) {
+      Toast.fire({ icon: "error", title: "No se pudo registrar el abono", text: error instanceof Error ? error.message : "Error inesperado" });
+    } finally {
+      setAdvanceSaving(false);
     }
   };
 
@@ -512,6 +498,7 @@ export default function Reservations() {
     const name = filterName.trim().toLowerCase();
     const phone = filterPhone.trim().toLowerCase();
     return availableReservations.filter((reservation) => {
+      if (filterStatus !== "all" && reservation.status !== filterStatus) return false;
       if (name && !(reservation.customerName || "").toLowerCase().includes(name)) return false;
       if (phone && !(reservation.customerPhone || "").toLowerCase().includes(phone)) return false;
       if (filterDate && reservation.reservationDate !== filterDate) return false;
@@ -522,9 +509,9 @@ export default function Reservations() {
       }
       return true;
     });
-  }, [availableReservations, filterName, filterPhone, filterDate, filterExpectedDate]);
+  }, [availableReservations, filterStatus, filterName, filterPhone, filterDate, filterExpectedDate]);
 
-  const hasFilters = Boolean(filterName.trim() || filterPhone.trim() || filterDate || filterExpectedDate);
+  const hasFilters = Boolean(filterStatus !== "all" || filterName.trim() || filterPhone.trim() || filterDate || filterExpectedDate);
 
   return (
     <div className="space-y-5 pb-8">
@@ -904,7 +891,7 @@ export default function Reservations() {
         </div>
         <Card>
           <CardContent className="p-3">
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
               <label className="space-y-1.5 text-sm">
                 <span className="font-medium">Nombre del cliente</span>
                 <Input value={filterName} onChange={(event) => setFilterName(event.target.value)} placeholder="Buscar por nombre..." />
@@ -921,12 +908,24 @@ export default function Reservations() {
                 <span className="font-medium">Fecha estimada de entrega</span>
                 <Input type="date" value={filterExpectedDate} onChange={(event) => setFilterExpectedDate(event.target.value)} />
               </label>
+              <label className="space-y-1.5 text-sm">
+                <span className="font-medium">Estado del pedido</span>
+                <Select value={filterStatus} onValueChange={(value) => setFilterStatus(value as ReservationStage | "all")}>
+                  <SelectTrigger><SelectValue placeholder="Todos los estados" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">Todos los estados</SelectItem>
+                    {STAGES.map((stage) => (
+                      <SelectItem key={stage.value} value={stage.value}>{stage.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </label>
               <div className="flex items-end">
                 <Button
                   type="button"
                   variant="outline"
                   className="w-full"
-                  onClick={() => { setFilterName(""); setFilterPhone(""); setFilterDate(""); setFilterExpectedDate(""); }}
+                  onClick={() => { setFilterName(""); setFilterPhone(""); setFilterDate(""); setFilterExpectedDate(""); setFilterStatus("all"); }}
                   disabled={!hasFilters}
                 >
                   <X className="mr-2 h-4 w-4" /> Limpiar filtros
@@ -949,7 +948,7 @@ export default function Reservations() {
           <Card><CardContent className="flex flex-col items-center py-10 text-center text-muted-foreground">
             <ClipboardCheck className="mb-2 h-9 w-9 opacity-30" />
             <p className="font-medium">No se encontraron pedidos con esos filtros</p>
-            <p className="text-sm">Prueba con otro nombre, teléfono o fecha, o limpia los filtros.</p>
+            <p className="text-sm">Prueba con otro nombre, teléfono, fecha o estado, o limpia los filtros.</p>
           </CardContent></Card>
         ) : (
           <div className="space-y-3">
@@ -974,24 +973,15 @@ export default function Reservations() {
                       <p>Total: <strong>{formatCurrency(reservation.total, currencySymbol)}</strong></p>
                       <p>Adelanto: <strong>{formatCurrency(reservation.deposit, currencySymbol)}</strong></p>
                       {reservation.deposit > 0 && (
-                        <div className="mt-1 flex flex-col items-end gap-1">
-                          {reservation.payments && reservation.payments.length > 1 ? (
-                            <div className="flex flex-wrap justify-end gap-1 max-w-[280px]">
-                              {reservation.payments.map((p, idx) => (
-                                <Badge key={idx} variant="secondary" className="text-[10px] font-semibold bg-amber-50 text-amber-900 border border-amber-200 py-0.5">
-                                  {p.paymentMethod}: {formatCurrency(p.amount, currencySymbol)}
-                                </Badge>
-                              ))}
-                            </div>
-                          ) : reservation.payments && reservation.payments.length === 1 ? (
-                            <span className="text-[11px] text-muted-foreground">
-                              Método: <strong>{reservation.payments[0].paymentMethod}</strong>
+                        <div className="mt-1 flex flex-col items-end gap-1 text-[11px] text-muted-foreground">
+                          {(reservation.payments ?? []).map((payment, idx) => (
+                            <span key={`${payment.createdAt}-${idx}`}>
+                              {payment.paymentMethod}: {formatCurrency(payment.amount, currencySymbol)} · {new Date(payment.createdAt).toLocaleString("es-BO")}
                             </span>
-                          ) : reservation.depositMethod ? (
-                            <span className="text-[11px] text-muted-foreground">
-                              Método: <strong>{reservation.depositMethod}</strong>
-                            </span>
-                          ) : null}
+                          ))}
+                          {(!reservation.payments || reservation.payments.length === 0) && reservation.depositMethod && (
+                            <span>Método: <strong>{reservation.depositMethod}</strong></span>
+                          )}
                         </div>
                       )}
                       <p className="mt-1.5">Saldo: <strong>{formatCurrency(reservation.balance, currencySymbol)}</strong></p>
@@ -1057,6 +1047,23 @@ export default function Reservations() {
                         <Pencil className="h-3.5 w-3.5" />
                         Editar
                       </Button>
+                      {reservation.balance > 0 && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-8 gap-1.5 border-amber-300 text-amber-800 hover:bg-amber-50"
+                          onClick={() => {
+                            setAdvancingReservation(reservation);
+                            setAdvanceAmount("");
+                          }}
+                          disabled={activeCashRegister?.status !== "open"}
+                          title={activeCashRegister?.status === "open" ? "Registrar un nuevo abono en la caja abierta" : "Abre la caja del día para registrar un abono"}
+                        >
+                          <Plus className="h-3.5 w-3.5" />
+                          Registrar abono
+                        </Button>
+                      )}
                       <Button
                         type="button"
                         variant="outline"
@@ -1073,18 +1080,20 @@ export default function Reservations() {
                         )}
                         Descargar ticket
                       </Button>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        className="h-8 gap-1.5 border-red-200 text-red-700 hover:bg-red-50"
-                        onClick={() => void cancelReservation(reservation)}
-                        disabled={actionLoadingId === reservation.id}
-                        title="Anular esta reserva"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                        Anular
-                      </Button>
+                      {canCancelReservation && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-8 gap-1.5 border-red-200 text-red-700 hover:bg-red-50"
+                          onClick={() => void cancelReservation(reservation)}
+                          disabled={actionLoadingId === reservation.id}
+                          title="Anular esta reserva"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                          Anular
+                        </Button>
+                      )}
                     </div>
 
                     {reservation.status === "listo_entrega" && !isDesigner && (
@@ -1106,7 +1115,7 @@ export default function Reservations() {
             <DialogHeader>
               <DialogTitle>Editar reserva #{editingId}</DialogTitle>
               <DialogDescription className="text-xs">
-                Modifica el cliente, productos, adelanto, fechas y notas de la reserva. La etapa de producción se reinicia a "Reserva".
+                Modifica los datos de la reserva. Los adelantos recibidos se conservan; registra nuevos abonos desde la tarjeta de la reserva.
               </DialogDescription>
             </DialogHeader>
             <form onSubmit={saveEdit} className="space-y-4">
@@ -1122,113 +1131,6 @@ export default function Reservations() {
                       ))}
                     </SelectContent>
                   </Select>
-                </div>
-                <div className="space-y-1.5 text-sm">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-medium">Adelanto</span>
-                    <Button
-                      type="button"
-                      variant={editIsMixedDeposit ? "default" : "outline"}
-                      size="sm"
-                      className="h-7 text-xs gap-1.5 rounded-lg"
-                      onClick={() => {
-                        const next = !editIsMixedDeposit;
-                        setEditIsMixedDeposit(next);
-                        if (next) {
-                          const cur = Number(editDeposit) || 0;
-                          if (cur > 0) {
-                            setEditMixedPayments([
-                              { method: "Efectivo", amount: (cur / 2).toFixed(2) },
-                              { method: "Transferencia", amount: (cur / 2).toFixed(2) },
-                            ]);
-                          }
-                        } else {
-                          setEditDeposit(String(editMixedTotal > 0 ? editMixedTotal : "0"));
-                        }
-                      }}
-                    >
-                      <Split className="h-3.5 w-3.5" />
-                      {editIsMixedDeposit ? "Cambiar a Pago Simple" : "Dividir Pago"}
-                    </Button>
-                  </div>
-                  {!editIsMixedDeposit && (
-                    <Input type="number" min="0" step="0.01" value={editDeposit} onChange={(event) => setEditDeposit(event.target.value)} />
-                  )}
-                  {editIsMixedDeposit && (
-                    <div className="space-y-2 rounded-lg border border-amber-200 bg-amber-50/50 p-2.5">
-                      <p className="text-xs text-amber-900 font-medium">
-                        Pago Mixto del Adelanto: registra los montos recibidos en cada método.
-                      </p>
-                      {editMixedPayments.map((p, idx) => (
-                        <div key={idx} className="grid grid-cols-[1.5fr_1fr_auto] gap-2 items-center">
-                          <Select
-                            value={p.method}
-                            onValueChange={(val) => {
-                              setEditMixedPayments((curr) => curr.map((item, i) => i === idx ? { ...item, method: val } : item));
-                            }}
-                          >
-                            <SelectTrigger className="h-8 text-xs bg-white">
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              {availablePaymentMethods.map((method) => (
-                                <SelectItem key={method} value={method}>
-                                  {method}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                          <Input
-                            type="number"
-                            min="0"
-                            step="0.01"
-                            placeholder="Monto"
-                            className="h-8 text-xs bg-white"
-                            value={p.amount}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              setEditMixedPayments((curr) => curr.map((item, i) => i === idx ? { ...item, amount: val } : item));
-                            }}
-                          />
-                          {editMixedPayments.length > 2 && (
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8 text-muted-foreground hover:text-destructive"
-                              onClick={() => {
-                                setEditMixedPayments((curr) => curr.filter((_, i) => i !== idx));
-                              }}
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
-                          )}
-                        </div>
-                      ))}
-                      <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-amber-200/60">
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          className="h-7 text-xs bg-white"
-                          onClick={() => {
-                            const unusedMethod = availablePaymentMethods.find(
-                              (m) => !editMixedPayments.some((p) => p.method === m)
-                            ) || availablePaymentMethods[0] || "Transferencia";
-                            setEditMixedPayments((curr) => [...curr, { method: unusedMethod, amount: "" }]);
-                          }}
-                        >
-                          <Plus className="h-3 w-3 mr-1" /> Agregar otro método
-                        </Button>
-                        <div className="text-xs font-semibold text-amber-950">
-                          Total Adelanto Mixto:{" "}
-                          <span className="text-primary font-bold text-sm">
-                            {formatCurrency(editMixedTotal, currencySymbol)}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-                  )}
                 </div>
                 <div className="space-y-1.5 text-sm">
                   <span className="font-medium">Fecha de reserva</span>
@@ -1288,7 +1190,8 @@ export default function Reservations() {
 
               <div className="rounded-lg bg-muted/40 px-3 py-2 text-sm">
                 <p>Total: <strong>{formatCurrency(editTotal, currencySymbol)}</strong></p>
-                <p>Saldo pendiente: <strong>{formatCurrency(Math.max(0, editTotal - editEffectiveDeposit), currencySymbol)}</strong></p>
+                <p>Adelantos recibidos: <strong>{formatCurrency(reservations?.find((reservation) => reservation.id === editingId)?.deposit ?? 0, currencySymbol)}</strong></p>
+                <p>Saldo pendiente: <strong>{formatCurrency(Math.max(0, editTotal - (reservations?.find((reservation) => reservation.id === editingId)?.deposit ?? 0)), currencySymbol)}</strong></p>
               </div>
 
               <DialogFooter>
@@ -1296,6 +1199,56 @@ export default function Reservations() {
                 <Button type="submit" disabled={editSaving}>
                   {editSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Check className="mr-2 h-4 w-4" />}
                   Guardar cambios
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {advancingReservation && (
+        <Dialog open={advancingReservation !== null} onOpenChange={(open) => { if (!open && !advanceSaving) setAdvancingReservation(null); }}>
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>Registrar abono · Reserva #{advancingReservation.id}</DialogTitle>
+              <DialogDescription>
+                El abono se registrará en la caja abierta de hoy y quedará separado de los pagos anteriores.
+              </DialogDescription>
+            </DialogHeader>
+            <form onSubmit={recordAdvance} className="space-y-4">
+              <div className="rounded-lg bg-muted/40 px-3 py-2 text-sm">
+                <p>Adelantado: <strong>{formatCurrency(advancingReservation.deposit, currencySymbol)}</strong></p>
+                <p>Saldo pendiente: <strong>{formatCurrency(advancingReservation.balance, currencySymbol)}</strong></p>
+              </div>
+              <label className="block space-y-1.5 text-sm">
+                <span className="font-medium">Monto recibido</span>
+                <Input
+                  type="number"
+                  min="0.01"
+                  max={advancingReservation.balance}
+                  step="0.01"
+                  required
+                  value={advanceAmount}
+                  onChange={(event) => setAdvanceAmount(event.target.value)}
+                  autoFocus
+                />
+              </label>
+              <label className="block space-y-1.5 text-sm">
+                <span className="font-medium">Método de pago</span>
+                <Select value={advanceMethod} onValueChange={setAdvanceMethod}>
+                  <SelectTrigger><SelectValue placeholder="Seleccionar método" /></SelectTrigger>
+                  <SelectContent>
+                    {availablePaymentMethods.map((method) => (
+                      <SelectItem key={method} value={method}>{method}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </label>
+              <DialogFooter>
+                <Button type="button" variant="outline" onClick={() => setAdvancingReservation(null)} disabled={advanceSaving}>Cancelar</Button>
+                <Button type="submit" disabled={advanceSaving || activeCashRegister?.status !== "open"}>
+                  {advanceSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Check className="mr-2 h-4 w-4" />}
+                  Confirmar abono
                 </Button>
               </DialogFooter>
             </form>

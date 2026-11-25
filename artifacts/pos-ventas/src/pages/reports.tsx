@@ -109,7 +109,7 @@ interface ReservationDepositItem {
   notes: string | null;
   saleId: number | null;
   createdAt: string;
-  payments: Array<{ paymentMethod: string; amount: number }>;
+  payments: Array<{ paymentMethod: string; amount: number; createdAt: string }>;
   products: Array<{
     id: number;
     productId: number | null;
@@ -495,7 +495,7 @@ export default function Reports() {
     if (!filteredDeposits?.length) return;
 
     const data = filteredDeposits.map((d) => {
-      const dateFormatted = formatDateDisplay(d.reservationDate || d.createdAt);
+      const dateFormatted = formatDateDisplay(d.payments[0]?.createdAt || d.createdAt);
       const paymentMethods = d.payments.map((p) => `${p.paymentMethod} (${p.amount})`).join(", ");
       const productsStr = d.products.map((p) => `${p.productName} (x${p.quantity})`).join("; ");
 
@@ -531,7 +531,7 @@ export default function Reports() {
       subtitle: `Período: ${dateFrom} al ${dateTo} · Total de registros: ${filteredDeposits.length}`,
       headers: ["Fecha", "N° Reserva", "Cliente", "Vendedor", "Método", "Adelanto", "Total", "Saldo", "Estado"],
       rows: filteredDeposits.map((item) => [
-        formatDateDisplay(item.reservationDate || item.createdAt),
+        formatDateDisplay(item.payments[0]?.createdAt || item.createdAt),
         `#R-${String(item.id).padStart(6, "0")}`,
         item.customerName,
         item.userName,
@@ -1583,7 +1583,7 @@ export default function Reports() {
                   <TableBody>
                     {filteredDeposits.map((item) => {
                       const isExpanded = !!expandedDepositRows[item.id];
-                      const dateFormatted = formatDateDisplay(item.reservationDate || item.createdAt);
+                      const dateFormatted = formatDateDisplay(item.payments[0]?.createdAt || item.createdAt);
                       const paymentMethodText =
                         item.payments.length > 1
                           ? item.payments.map((p) => `${p.paymentMethod} (${formatCurrency(p.amount, currencySymbol)})`).join(" + ")
@@ -1729,7 +1729,7 @@ export default function Reports() {
                                       <span className="font-semibold text-muted-foreground">Desglose del adelanto:</span>
                                       {item.payments.map((p, idx) => (
                                         <Badge key={idx} variant="outline" className="text-[11px]">
-                                          {p.paymentMethod}: {formatCurrency(p.amount, currencySymbol)}
+                                          {p.paymentMethod}: {formatCurrency(p.amount, currencySymbol)} · {new Date(p.createdAt).toLocaleString("es-BO")}
                                         </Badge>
                                       ))}
                                     </div>

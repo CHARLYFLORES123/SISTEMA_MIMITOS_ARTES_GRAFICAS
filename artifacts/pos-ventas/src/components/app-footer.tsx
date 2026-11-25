@@ -1,6 +1,6 @@
 export function AppFooter() {
   return (
-    <footer className="w-full pb-8 pt-6 text-center text-white/90 text-xs sm:text-sm">
+    <footer className="w-full pb-8 pt-6 text-center text-muted-foreground text-xs sm:text-sm">
       <p className="font-semibold tracking-wide">
         Mimitos Artes Gráficas
       </p>

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useLocation, Link } from "wouter";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -7,7 +7,7 @@ import { useLogin } from "@workspace/api-client-react";
 import { setToken } from "@/lib/auth";
 import { useToast } from "@/hooks/use-toast";
 import { Input } from "@/components/ui/input";
-import { Eye, EyeOff, Building2 } from "lucide-react";
+import { Eye, EyeOff } from "lucide-react";
 import { AppFooter } from "@/components/app-footer";
 
 const loginSchema = z.object({
@@ -15,20 +15,13 @@ const loginSchema = z.object({
   password: z.string().min(6, "La contraseña debe tener al menos 6 caracteres"),
 });
 
+const defaultLogo = `${import.meta.env.BASE_URL}images/mimitos-logo.jpg`;
+
 export default function Login() {
   const [, setLocation] = useLocation();
   const { toast } = useToast();
   const loginMutation = useLogin();
   const [showPassword, setShowPassword] = useState(false);
-  const [businessLogo, setBusinessLogo] = useState<string | null>(null);
-
-  useEffect(() => {
-    const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
-    fetch(`${apiUrl.replace(/\/$/, "")}/business-settings/public`)
-      .then((response) => response.ok ? response.json() : null)
-      .then((data) => setBusinessLogo(data?.logoUrl ?? null))
-      .catch(() => setBusinessLogo(null));
-  }, []);
 
   const {
     register,
@@ -69,7 +62,7 @@ export default function Login() {
       className="min-h-screen flex flex-col items-center justify-center p-4"
       style={{
         backgroundImage:
-          "linear-gradient(rgba(15, 23, 42, 0.55), rgba(15, 23, 42, 0.55)), url('/images/logo.jpg')",
+          "radial-gradient(ellipse at 18% 15%, rgba(146, 201, 196, 0.5), transparent 42%), linear-gradient(135deg, #eef7f2 0%, #fffaf3 55%, #f9eee8 100%)",
         backgroundSize: "cover",
         backgroundPosition: "center",
         backgroundRepeat: "no-repeat",
@@ -81,11 +74,7 @@ export default function Login() {
           {/* Logo */}
           <div className="flex flex-col items-center mb-7">
             <div className="w-16 h-16 rounded-2xl bg-primary flex items-center justify-center mb-3 shadow-md shadow-primary/30 overflow-hidden">
-              {businessLogo ? (
-                <img src={businessLogo} alt="Logo de la empresa" className="h-full w-full object-contain bg-white p-1" onError={() => setBusinessLogo(null)} />
-              ) : (
-                <Building2 className="w-8 h-8 text-white" />
-              )}
+              <img src={defaultLogo} alt="Logo de Mimitos Artes Gráficas" className="h-full w-full object-contain bg-white p-1" />
             </div>
             <h1 className="text-2xl font-bold text-foreground">Iniciar sesión</h1>
             <p className="text-sm text-muted-foreground mt-1">Ingresa tus credenciales para continuar</p>
@@ -164,6 +153,11 @@ export default function Login() {
             ¿No tienes cuenta?{" "}
             <Link href="/register" className="text-primary font-medium hover:underline">
               Regístrate
+            </Link>
+          </div>
+          <div className="mt-3 text-center text-sm">
+            <Link href="/" className="text-primary font-medium hover:underline">
+              Volver a la página principal
             </Link>
           </div>
         </div>

@@ -5,7 +5,7 @@ import {
   salesTable, saleDetailsTable, salePaymentsTable, cashRegisterSessionsTable, cashRegisterExpensesTable,
 } from "@workspace/db";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { verifyToken, requireRoles, AuthRequest } from "../middlewares/auth";
+import { verifyToken, requireRoles, requireAdmin, AuthRequest } from "../middlewares/auth";
 import { auditLog } from "../lib/audit";
 import { formatProductLabel } from "../lib/product-label";
 
@@ -15,6 +15,17 @@ router.use(verifyToken);
 const canManage = requireRoles(["admin", "diseñador", "vendedor"]);
 const stageOrder = ["reserva", "produccion", "listo_entrega"] as const;
 const reservationStageSchema = z.enum(stageOrder);
+
+function currentBusinessDate() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/La_Paz",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const dateParts = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
+}
 
 const createReservationSchema = z.object({
   customerId: z.number().int().positive().nullable().optional(),
@@ -36,6 +47,16 @@ const createReservationSchema = z.object({
   })).min(1),
 });
 
+const updateReservationSchema = createReservationSchema.extend({
+  deposit: z.number().finite().nonnegative().max(9_999_999_999.99).optional(),
+});
+
+const recordReservationPaymentSchema = z.object({
+  paymentMethod: z.string().trim().min(1).max(100),
+  amount: z.number().finite().positive().max(9_999_999_999.99),
+  cashRegisterSessionId: z.number().int().positive(),
+});
+
 const deliverSchema = z.object({
   cashRegisterSessionId: z.number().int().positive(),
   paymentMethod: z.string().trim().min(1).max(100),
@@ -53,7 +74,7 @@ function formatReservation(
   customerName: string | null,
   customerPhone: string | null,
   userName: string | null,
-  payments?: Array<{ paymentMethod: string; amount: number }>,
+  payments?: Array<{ paymentMethod: string; amount: number; createdAt?: string | Date }>,
 ) {
   return {
     id: reservation.id,
@@ -73,7 +94,10 @@ function formatReservation(
     notes: reservation.notes,
     saleId: reservation.saleId,
     createdAt: reservation.createdAt.toISOString(),
-    payments: payments ?? [],
+    payments: payments?.map((payment) => ({
+      ...payment,
+      createdAt: payment.createdAt instanceof Date ? payment.createdAt.toISOString() : payment.createdAt,
+    })) ?? [],
     details: details.map((detail) => ({
       id: detail.id,
       productId: detail.productId,
@@ -107,9 +131,17 @@ async function fetchReservation(id: number) {
     .where(eq(reservationPaymentsTable.reservationId, id))
     .orderBy(reservationPaymentsTable.id);
   const paymentList = payments.length > 0
-    ? payments.map((p) => ({ paymentMethod: p.paymentMethod, amount: Number(p.amount) }))
+    ? payments.map((p) => ({
+      paymentMethod: p.paymentMethod,
+      amount: Number(p.amount),
+      createdAt: p.createdAt.toISOString(),
+    }))
     : (Number(row.reservation.deposit) > 0
-      ? [{ paymentMethod: row.reservation.depositMethod || "Efectivo", amount: Number(row.reservation.deposit) }]
+      ? [{
+        paymentMethod: row.reservation.depositMethod || "Efectivo",
+        amount: Number(row.reservation.deposit),
+        createdAt: row.reservation.createdAt.toISOString(),
+      }]
       : []);
   return formatReservation(row.reservation, details, row.customerName, row.customerPhone, row.userName, paymentList);
 }
@@ -157,17 +189,21 @@ router.get("/", requireRoles(["admin", "diseñador", "vendedor"]), async (req: A
         .where(inArray(reservationPaymentsTable.reservationId, rows.map(({ reservation }) => reservation.id)))
         .orderBy(reservationPaymentsTable.id)
       : [];
-    const paymentsByReservation = new Map<number, Array<{ paymentMethod: string; amount: number }>>();
+    const paymentsByReservation = new Map<number, Array<{ paymentMethod: string; amount: number; createdAt: Date }>>();
     for (const p of reservationPayments) {
       const list = paymentsByReservation.get(p.reservationId) ?? [];
-      list.push({ paymentMethod: p.paymentMethod, amount: Number(p.amount) });
+      list.push({ paymentMethod: p.paymentMethod, amount: Number(p.amount), createdAt: p.createdAt });
       paymentsByReservation.set(p.reservationId, list);
     }
 
     res.json(rows.map(({ reservation, customerName, customerPhone, userName }) => {
       let resPayments = paymentsByReservation.get(reservation.id);
       if ((!resPayments || resPayments.length === 0) && Number(reservation.deposit) > 0) {
-        resPayments = [{ paymentMethod: reservation.depositMethod || "Efectivo", amount: Number(reservation.deposit) }];
+        resPayments = [{
+          paymentMethod: reservation.depositMethod || "Efectivo",
+          amount: Number(reservation.deposit),
+          createdAt: reservation.createdAt,
+        }];
       }
       return formatReservation(reservation, detailsByReservation.get(reservation.id) ?? [], customerName, customerPhone, userName, resPayments);
     }));
@@ -249,7 +285,7 @@ router.post("/", canManage, async (req: AuthRequest, res) => {
       let targetSessionId = cashRegisterSessionId ?? null;
 
       if (!targetSessionId && roundedDeposit > 0) {
-        const targetDate = reservationDate || new Date().toISOString().slice(0, 10);
+        const targetDate = currentBusinessDate();
         // 1. Try finding open session for this user for target date
         let [openSession] = await tx.select({ id: cashRegisterSessionsTable.id })
           .from(cashRegisterSessionsTable)
@@ -322,6 +358,7 @@ router.post("/", canManage, async (req: AuthRequest, res) => {
               reservationId: created.id,
               paymentMethod: sp.paymentMethod,
               amount: sp.amount.toFixed(2),
+              cashRegisterSessionId: targetSessionId,
             });
           }
         } else {
@@ -329,6 +366,7 @@ router.post("/", canManage, async (req: AuthRequest, res) => {
             reservationId: created.id,
             paymentMethod: depositMethod?.trim() || "Efectivo",
             amount: roundedDeposit.toFixed(2),
+            cashRegisterSessionId: targetSessionId,
           });
         }
       }
@@ -352,10 +390,10 @@ router.post("/", canManage, async (req: AuthRequest, res) => {
 router.patch("/:id", canManage, async (req: AuthRequest, res) => {
   const id = Number(req.params.id);
   if (!Number.isSafeInteger(id) || id < 1) { res.status(400).json({ message: "Reserva inválida" }); return; }
-  const parsed = createReservationSchema.safeParse(req.body);
+  const parsed = updateReservationSchema.safeParse(req.body);
   if (!parsed.success) { res.status(400).json({ message: "Datos inválidos", errors: parsed.error.flatten() }); return; }
 
-  const { customerId, deposit, depositMethod, payments, reservationDate, expectedAt, notes, details } = parsed.data;
+  const { customerId, deposit, reservationDate, expectedAt, notes, details } = parsed.data;
   const productIds = [...new Set(details.map((detail) => detail.productId))];
   try {
     const [reservation] = await db.select().from(reservationsTable).where(eq(reservationsTable.id, id)).limit(1);
@@ -387,41 +425,24 @@ router.patch("/:id", canManage, async (req: AuthRequest, res) => {
       };
     });
     const roundedTotal = Number(normalizedDetails.reduce((sum, detail) => sum + detail.subtotal, 0).toFixed(2));
-    const roundedDeposit = Number(deposit.toFixed(2));
-    if (roundedDeposit > roundedTotal) {
-      res.status(400).json({ message: "El adelanto no puede ser mayor al total de la reserva" });
-      return;
-    }
-
-    const splitPayments = (payments && payments.length > 0) ? payments : null;
-    let effectiveDepositMethod: string | null = null;
-    if (roundedDeposit > 0) {
-      if (splitPayments) {
-        const splitTotal = Number(splitPayments.reduce((acc, p) => acc + p.amount, 0).toFixed(2));
-        if (Math.abs(splitTotal - roundedDeposit) > 0.05) {
-          res.status(400).json({
-            message: `La suma de los pagos del adelanto (${splitTotal.toFixed(2)}) no coincide con el adelanto total (${roundedDeposit.toFixed(2)})`,
-          });
-          return;
-        }
-        effectiveDepositMethod = splitPayments.map((p) => `${p.paymentMethod}: ${p.amount.toFixed(2)}`).join(" / ");
-      } else {
-        effectiveDepositMethod = depositMethod?.trim() || "Efectivo";
+    const updateError = await db.transaction(async (tx) => {
+      const [lockedReservation] = await tx.select().from(reservationsTable)
+        .where(eq(reservationsTable.id, id)).for("update").limit(1);
+      if (!lockedReservation) return { message: "Reserva no encontrada", status: 404 as const };
+      if (lockedReservation.status === "entregada") {
+        return { message: "La reserva ya fue entregada y no se puede editar", status: 409 as const };
       }
-    }
-
-    const previousDeposit = Number(reservation.deposit);
-
-    await db.transaction(async (tx) => {
-      // Recalcular el saldo de la caja: la reserva apunta a una sesión de caja
-      // Si el adelanto cambia, el total cobrado de la caja debe ajustarse.
-      const currentDeposit = Number(reservation.deposit);
+      const lockedDeposit = Number(lockedReservation.deposit);
+      if (lockedDeposit > roundedTotal) {
+        return { message: "El total no puede ser menor que los adelantos ya recibidos", status: 400 as const };
+      }
+      if (deposit !== undefined && Number(deposit.toFixed(2)) !== lockedDeposit) {
+        return { message: "Los adelantos no se modifican al editar la reserva; registra un nuevo abono", status: 400 as const };
+      }
 
       await tx.update(reservationsTable).set({
         customerId: customerId ?? null,
         total: roundedTotal.toFixed(2),
-        deposit: roundedDeposit.toFixed(2),
-        depositMethod: effectiveDepositMethod,
         reservationDate,
         expectedAt: expectedAt ?? null,
         notes: notes?.trim() || null,
@@ -444,40 +465,101 @@ router.patch("/:id", canManage, async (req: AuthRequest, res) => {
           status: "reserva",
         };
       }));
-
-      // Reemplazar los pagos de la reserva (adelanto)
-      await tx.delete(reservationPaymentsTable).where(eq(reservationPaymentsTable.reservationId, id));
-      if (roundedDeposit > 0) {
-        if (splitPayments) {
-          for (const sp of splitPayments) {
-            await tx.insert(reservationPaymentsTable).values({
-              reservationId: id,
-              paymentMethod: sp.paymentMethod,
-              amount: sp.amount.toFixed(2),
-            });
-          }
-        } else {
-          await tx.insert(reservationPaymentsTable).values({
-            reservationId: id,
-            paymentMethod: depositMethod?.trim() || "Efectivo",
-            amount: roundedDeposit.toFixed(2),
-          });
-        }
-      }
-
-      void previousDeposit;
-      void currentDeposit;
+      return null;
     });
+
+    if (updateError) {
+      res.status(updateError.status).json({ message: updateError.message });
+      return;
+    }
 
     const result = await fetchReservation(id);
     res.json(result);
     auditLog({
       req, action: "updated", entity: "reservation", entityId: id,
-      entityName: `Reserva #${id}`, details: { total: roundedTotal, deposit: roundedDeposit, payments: splitPayments ?? effectiveDepositMethod },
+      entityName: `Reserva #${id}`, details: { total: roundedTotal },
     });
   } catch (err) {
     req.log.error({ err }, "UpdateReservation error");
     res.status(500).json({ message: "Error interno" });
+  }
+});
+
+// POST /api/reservations/:id/payments — Registrar un abono recibido en la caja abierta actual
+router.post("/:id/payments", canManage, async (req: AuthRequest, res) => {
+  const id = Number(req.params.id);
+  const parsed = recordReservationPaymentSchema.safeParse(req.body);
+  if (!Number.isSafeInteger(id) || id < 1 || !parsed.success) {
+    res.status(400).json({ message: "Datos inválidos" });
+    return;
+  }
+
+  const amount = Number(parsed.data.amount.toFixed(2));
+  try {
+    const result = await db.transaction(async (tx) => {
+      const [reservation] = await tx.select().from(reservationsTable)
+        .where(eq(reservationsTable.id, id)).for("update").limit(1);
+      if (!reservation) return { error: "Reserva no encontrada", status: 404 as const };
+      if (reservation.status === "entregada" || reservation.status === "cancelada") {
+        return { error: "No se pueden registrar abonos en una reserva entregada o anulada", status: 409 as const };
+      }
+
+      const [session] = await tx.select({
+        id: cashRegisterSessionsTable.id,
+        businessDate: cashRegisterSessionsTable.businessDate,
+      })
+        .from(cashRegisterSessionsTable)
+        .where(and(
+          eq(cashRegisterSessionsTable.id, parsed.data.cashRegisterSessionId),
+          eq(cashRegisterSessionsTable.userId, req.userId!),
+          eq(cashRegisterSessionsTable.status, "open"),
+        ))
+        .for("update")
+        .limit(1);
+      if (!session || session.businessDate !== currentBusinessDate()) {
+        return { error: "Abre la caja del día antes de registrar un abono", status: 409 as const };
+      }
+
+      const currentDeposit = Number(reservation.deposit);
+      const total = Number(reservation.total);
+      if (amount > total - currentDeposit + 0.005) {
+        return { error: "El abono no puede ser mayor al saldo pendiente de la reserva", status: 400 as const };
+      }
+
+      await tx.insert(reservationPaymentsTable).values({
+        reservationId: id,
+        paymentMethod: parsed.data.paymentMethod,
+        amount: amount.toFixed(2),
+        cashRegisterSessionId: session.id,
+      });
+      await tx.update(reservationsTable).set({
+        deposit: (currentDeposit + amount).toFixed(2),
+        depositMethod: currentDeposit > 0 && reservation.depositMethod !== parsed.data.paymentMethod
+          ? "Varios métodos"
+          : parsed.data.paymentMethod,
+        updatedAt: new Date(),
+      }).where(eq(reservationsTable.id, id));
+
+      return { reservationId: id };
+    });
+
+    if ("error" in result) {
+      if (typeof result.status !== "number") throw new Error("Reservation payment returned no HTTP status");
+      res.status(result.status).json({ message: result.error });
+      return;
+    }
+
+    const reservation = await fetchReservation(id);
+    if (!reservation) throw new Error(`Recorded payment for missing reservation ${id}`);
+    res.json(reservation);
+    auditLog({
+      req, action: "created", entity: "reservation_payment", entityId: id,
+      entityName: `Abono de reserva #${id}`,
+      details: { amount, paymentMethod: parsed.data.paymentMethod, cashRegisterSessionId: parsed.data.cashRegisterSessionId },
+    });
+  } catch (err) {
+    req.log.error({ err }, "RecordReservationPayment error");
+    res.status(500).json({ message: "No se pudo registrar el abono" });
   }
 });
 
@@ -534,7 +616,7 @@ router.patch("/:id/details/:detailId/status", canManage, async (req: AuthRequest
 });
 
 // POST /api/reservations/:id/cancel — Anular una reserva (solo si no está entregada)
-router.post("/:id/cancel", canManage, async (req: AuthRequest, res) => {
+router.post("/:id/cancel", requireAdmin, async (req: AuthRequest, res) => {
   const id = Number(req.params.id);
   if (!Number.isSafeInteger(id) || id < 1) { res.status(400).json({ message: "Reserva inválida" }); return; }
   const parsed = z.object({

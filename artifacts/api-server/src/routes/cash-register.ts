@@ -27,6 +27,71 @@ function isValidBusinessDate(value: unknown): value is string {
   return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
 }
 
+type CashReservation = {
+  id: number;
+  deposit: string;
+  depositMethod: string | null;
+  cashRegisterSessionId: number | null;
+  createdAt: Date;
+};
+
+type CashReservationPayment = typeof reservationPaymentsTable.$inferSelect;
+
+function getBusinessDate(value: Date) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/La_Paz",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(value);
+  const dateParts = Object.fromEntries(parts.map(({ type, value: partValue }) => [type, partValue]));
+  return `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
+}
+
+function getPaymentsForSessions(
+  reservation: CashReservation,
+  paymentRows: CashReservationPayment[],
+  sessionIds: number[],
+  businessDate: string,
+) {
+  const legacySessionMatches = reservation.cashRegisterSessionId !== null
+    && sessionIds.includes(reservation.cashRegisterSessionId);
+  const unassignedPayments = paymentRows.filter((payment) => payment.cashRegisterSessionId === null);
+  const legacyDateMatches = reservation.cashRegisterSessionId === null
+    && (unassignedPayments.some((payment) => getBusinessDate(payment.createdAt) === businessDate)
+      || (paymentRows.length === 0 && getBusinessDate(reservation.createdAt) === businessDate));
+  const assignedPayments = paymentRows.filter(
+    (payment) => payment.cashRegisterSessionId !== null && sessionIds.includes(payment.cashRegisterSessionId),
+  );
+
+  if (assignedPayments.length > 0) {
+    return [
+      ...assignedPayments,
+      ...(legacySessionMatches ? unassignedPayments : []),
+    ].map(({ paymentMethod, amount, createdAt }) => ({
+      paymentMethod,
+      amount: Number(amount),
+      createdAt,
+    }));
+  }
+  if (unassignedPayments.length > 0 && (legacySessionMatches || legacyDateMatches)) {
+    return unassignedPayments.map(({ paymentMethod, amount, createdAt }) => ({
+      paymentMethod,
+      amount: Number(amount),
+      createdAt,
+    }));
+  }
+  if (paymentRows.length > 0) return [];
+  if (legacySessionMatches || legacyDateMatches) {
+    return [{
+      paymentMethod: reservation.depositMethod || "Efectivo",
+      amount: Number(reservation.deposit),
+      createdAt: reservation.createdAt,
+    }];
+  }
+  return [];
+}
+
 async function getSessionSummary(sessionId: number) {
   const [session] = await db
     .select({
@@ -86,7 +151,21 @@ async function getSessionSummary(sessionId: number) {
         eq(reservationsTable.userId, session.session.userId),
         sql`${reservationsTable.userId} IS NULL`
       ),
-      sql`CAST(${reservationsTable.reservationDate} AS text) = ${session.session.businessDate}`
+      or(
+        sql`EXISTS (
+          SELECT 1 FROM reservation_payments rp
+          WHERE rp.reservation_id = ${reservationsTable.id}
+            AND rp.cash_register_session_id IS NULL
+            AND to_char(rp.created_at AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD') = ${session.session.businessDate}
+        )`,
+        and(
+          sql`NOT EXISTS (
+            SELECT 1 FROM reservation_payments rp
+            WHERE rp.reservation_id = ${reservationsTable.id}
+          )`,
+          sql`to_char(${reservationsTable.createdAt} AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD') = ${session.session.businessDate}`,
+        ),
+      )!,
     ));
 
   const reservations = await db
@@ -95,6 +174,7 @@ async function getSessionSummary(sessionId: number) {
       total: reservationsTable.total,
       deposit: reservationsTable.deposit,
       depositMethod: reservationsTable.depositMethod,
+      cashRegisterSessionId: reservationsTable.cashRegisterSessionId,
       createdAt: reservationsTable.createdAt,
       customerId: reservationsTable.customerId,
       customerName: customersTable.name,
@@ -111,10 +191,29 @@ async function getSessionSummary(sessionId: number) {
       sql`NOT EXISTS (SELECT 1 FROM sales s WHERE s.id = ${reservationsTable.saleId} AND s.status = 'cancelada')`,
       or(
         eq(reservationsTable.cashRegisterSessionId, sessionId),
+        sql`EXISTS (
+          SELECT 1 FROM reservation_payments rp
+          WHERE rp.reservation_id = ${reservationsTable.id}
+            AND rp.cash_register_session_id = ${sessionId}
+        )`,
         and(
           sql`${reservationsTable.cashRegisterSessionId} IS NULL`,
           eq(reservationsTable.userId, session.session.userId),
-          sql`CAST(${reservationsTable.reservationDate} AS text) = ${session.session.businessDate}`
+          or(
+            sql`EXISTS (
+              SELECT 1 FROM reservation_payments rp
+              WHERE rp.reservation_id = ${reservationsTable.id}
+                AND rp.cash_register_session_id IS NULL
+                AND to_char(rp.created_at AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD') = ${session.session.businessDate}
+            )`,
+            and(
+              sql`NOT EXISTS (
+                SELECT 1 FROM reservation_payments rp
+                WHERE rp.reservation_id = ${reservationsTable.id}
+              )`,
+              sql`to_char(${reservationsTable.createdAt} AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD') = ${session.session.businessDate}`,
+            ),
+          )!
         )
       )
     ))
@@ -132,10 +231,12 @@ async function getSessionSummary(sessionId: number) {
   }
 
   for (const resv of reservations) {
-    const pList = paymentsByReservation.get(resv.id);
-    const effectivePayments = pList?.length
-      ? pList.map(({ paymentMethod, amount }) => ({ paymentMethod, amount: Number(amount) }))
-      : [{ paymentMethod: resv.depositMethod || "Efectivo", amount: Number(resv.deposit) }];
+    const effectivePayments = getPaymentsForSessions(
+      resv,
+      paymentsByReservation.get(resv.id) ?? [],
+      [sessionId],
+      session.session.businessDate,
+    );
     for (const payment of effectivePayments) {
       totalsByMethod.set(payment.paymentMethod, (totalsByMethod.get(payment.paymentMethod) ?? 0) + payment.amount);
     }
@@ -171,10 +272,12 @@ async function getSessionSummary(sessionId: number) {
   let cashDeposits = 0;
   let totalDeposits = 0;
   for (const resv of reservations) {
-    const pList = paymentsByReservation.get(resv.id);
-    const effective = pList?.length
-      ? pList.map(({ paymentMethod, amount }) => ({ paymentMethod, amount: Number(amount) }))
-      : [{ paymentMethod: resv.depositMethod || "Efectivo", amount: Number(resv.deposit) }];
+    const effective = getPaymentsForSessions(
+      resv,
+      paymentsByReservation.get(resv.id) ?? [],
+      [sessionId],
+      session.session.businessDate,
+    );
     for (const p of effective) {
       totalDeposits += p.amount;
       if (p.paymentMethod.toLowerCase().includes("efectivo")) {
@@ -221,20 +324,26 @@ async function getSessionSummary(sessionId: number) {
     cashDeposits,
     totalDeposits,
     deposits: reservations.map((resv) => {
-      const pList = paymentsByReservation.get(resv.id);
-      const effectivePayments = pList?.length
-        ? pList.map(({ paymentMethod, amount }) => ({ paymentMethod, amount: Number(amount) }))
-        : [{ paymentMethod: resv.depositMethod || "Efectivo", amount: Number(resv.deposit) }];
+      const effectivePayments = getPaymentsForSessions(
+        resv,
+        paymentsByReservation.get(resv.id) ?? [],
+        [sessionId],
+        session.session.businessDate,
+      );
+      const latestPayment = effectivePayments.reduce(
+        (latest, payment) => payment.createdAt > latest ? payment.createdAt : latest,
+        resv.createdAt,
+      );
       return {
         id: resv.id,
         customerName: resv.customerName || "Sin cliente",
         userName: resv.userName || "—",
         userId: resv.userId,
         total: Number(resv.total),
-        deposit: Number(resv.deposit),
-        depositMethod: resv.depositMethod,
-        createdAt: resv.createdAt.toISOString(),
-        payments: effectivePayments,
+        deposit: roundMoney(effectivePayments.reduce((sum, payment) => sum + payment.amount, 0)),
+        depositMethod: [...new Set(effectivePayments.map((payment) => payment.paymentMethod))].join(" / ") || resv.depositMethod,
+        createdAt: latestPayment.toISOString(),
+        payments: effectivePayments.map(({ paymentMethod, amount }) => ({ paymentMethod, amount })),
       };
     }),
     totalsByMethod: Object.fromEntries([...totalsByMethod].map(([method, amount]) => [method, roundMoney(amount)])),
@@ -300,7 +409,21 @@ async function getConsolidatedSummary(businessDate: string) {
           sql`${reservationsTable.depositRefunded} = false`,
           sql`NOT EXISTS (SELECT 1 FROM sales s WHERE s.id = ${reservationsTable.saleId} AND s.status = 'cancelada')`,
           eq(reservationsTable.userId, s.session.userId),
-          sql`CAST(${reservationsTable.reservationDate} AS text) = ${businessDate}`
+          or(
+            sql`EXISTS (
+              SELECT 1 FROM reservation_payments rp
+              WHERE rp.reservation_id = ${reservationsTable.id}
+                AND rp.cash_register_session_id IS NULL
+                AND to_char(rp.created_at AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD') = ${businessDate}
+            )`,
+            and(
+              sql`NOT EXISTS (
+                SELECT 1 FROM reservation_payments rp
+                WHERE rp.reservation_id = ${reservationsTable.id}
+              )`,
+              sql`to_char(${reservationsTable.createdAt} AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD') = ${businessDate}`,
+            ),
+          )!
         ));
     }
   }
@@ -359,6 +482,7 @@ async function getConsolidatedSummary(businessDate: string) {
       deposit: reservationsTable.deposit,
       depositMethod: reservationsTable.depositMethod,
       cashRegisterSessionId: reservationsTable.cashRegisterSessionId,
+      reservationDate: reservationsTable.reservationDate,
       createdAt: reservationsTable.createdAt,
       customerId: reservationsTable.customerId,
       customerName: customersTable.name,
@@ -375,12 +499,30 @@ async function getConsolidatedSummary(businessDate: string) {
       sql`NOT EXISTS (SELECT 1 FROM sales s WHERE s.id = ${reservationsTable.saleId} AND s.status = 'cancelada')`,
       or(
         sessionIds.length > 0 ? inArray(reservationsTable.cashRegisterSessionId, sessionIds) : sql`FALSE`,
+        sessionIds.length > 0
+          ? or(...sessionIds.map((sessionId) => sql`EXISTS (
+              SELECT 1 FROM reservation_payments rp
+              WHERE rp.reservation_id = ${reservationsTable.id}
+                AND rp.cash_register_session_id = ${sessionId}
+            )`))!
+          : sql`FALSE`,
         and(
           sql`${reservationsTable.cashRegisterSessionId} IS NULL`,
           or(
-            sql`CAST(${reservationsTable.reservationDate} AS text) = ${businessDate}`,
-            sql`CAST(${reservationsTable.createdAt} AS date) = CAST(${businessDate} AS date)`
-          )
+            sql`EXISTS (
+              SELECT 1 FROM reservation_payments rp
+              WHERE rp.reservation_id = ${reservationsTable.id}
+                AND rp.cash_register_session_id IS NULL
+                AND to_char(rp.created_at AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD') = ${businessDate}
+            )`,
+            and(
+              sql`NOT EXISTS (
+                SELECT 1 FROM reservation_payments rp
+                WHERE rp.reservation_id = ${reservationsTable.id}
+              )`,
+              sql`to_char(${reservationsTable.createdAt} AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD') = ${businessDate}`,
+            ),
+          )!
         )
       )
     ))
@@ -399,10 +541,12 @@ async function getConsolidatedSummary(businessDate: string) {
   let totalCashDeposits = 0;
   let totalDeposits = 0;
   for (const resv of reservations) {
-    const pList = paymentsByReservation.get(resv.id);
-    const effective = pList?.length
-      ? pList.map(({ paymentMethod, amount }) => ({ paymentMethod, amount: Number(amount) }))
-      : [{ paymentMethod: resv.depositMethod || "Efectivo", amount: Number(resv.deposit) }];
+    const effective = getPaymentsForSessions(
+      resv,
+      paymentsByReservation.get(resv.id) ?? [],
+      sessionIds,
+      businessDate,
+    );
     for (const payment of effective) {
       totalDeposits += payment.amount;
       totalsByMethod.set(payment.paymentMethod, (totalsByMethod.get(payment.paymentMethod) ?? 0) + payment.amount);
@@ -458,14 +602,18 @@ async function getConsolidatedSummary(businessDate: string) {
         .reduce((sum, p) => sum + p.amount, 0);
     }
 
-    const sDeposits = reservations.filter((r) => r.cashRegisterSessionId === sId);
+    const sDeposits = reservations.map((reservation) => ({
+      reservation,
+      payments: getPaymentsForSessions(
+        reservation,
+        paymentsByReservation.get(reservation.id) ?? [],
+        [sId],
+        businessDate,
+      ),
+    })).filter(({ payments: reservationPayments }) => reservationPayments.length > 0);
     let sCashDeposits = 0;
     let sTotalDeposits = 0;
-    for (const resv of sDeposits) {
-      const pList = paymentsByReservation.get(resv.id);
-      const effective = pList?.length
-        ? pList.map(({ paymentMethod, amount }) => ({ paymentMethod, amount: Number(amount) }))
-        : [{ paymentMethod: resv.depositMethod || "Efectivo", amount: Number(resv.deposit) }];
+    for (const { payments: effective } of sDeposits) {
       for (const p of effective) {
         sTotalDeposits += p.amount;
         if (p.paymentMethod.toLowerCase().includes("efectivo")) {
@@ -525,22 +673,28 @@ async function getConsolidatedSummary(businessDate: string) {
     cashDeposits: roundMoney(totalCashDeposits),
     totalDeposits: roundMoney(totalDeposits),
     deposits: reservations.map((resv) => {
-      const pList = paymentsByReservation.get(resv.id);
-      const effectivePayments = pList?.length
-        ? pList.map(({ paymentMethod, amount }) => ({ paymentMethod, amount: Number(amount) }))
-        : [{ paymentMethod: resv.depositMethod || "Efectivo", amount: Number(resv.deposit) }];
+      const effectivePayments = getPaymentsForSessions(
+        resv,
+        paymentsByReservation.get(resv.id) ?? [],
+        sessionIds,
+        businessDate,
+      );
+      const latestPayment = effectivePayments.reduce(
+        (latest, payment) => payment.createdAt > latest ? payment.createdAt : latest,
+        resv.createdAt,
+      );
       return {
         id: resv.id,
         customerName: resv.customerName || "Sin cliente",
         userName: resv.userName || "—",
         userId: resv.userId,
         total: Number(resv.total),
-        deposit: Number(resv.deposit),
-        depositMethod: resv.depositMethod,
-        createdAt: resv.createdAt.toISOString(),
-        payments: effectivePayments,
+        deposit: roundMoney(effectivePayments.reduce((sum, payment) => sum + payment.amount, 0)),
+        depositMethod: [...new Set(effectivePayments.map((payment) => payment.paymentMethod))].join(" / ") || resv.depositMethod,
+        createdAt: latestPayment.toISOString(),
+        payments: effectivePayments.map(({ paymentMethod, amount }) => ({ paymentMethod, amount })),
       };
-    }),
+    }).filter((deposit) => deposit.deposit > 0),
     totalsByMethod: Object.fromEntries([...totalsByMethod].map(([method, amount]) => [method, roundMoney(amount)])),
     expenses: expenses.map((expense) => ({
       id: expense.id,
@@ -719,22 +873,33 @@ router.post("/:id/close", async (req: AuthRequest, res) => {
         id: reservationsTable.id,
         deposit: reservationsTable.deposit,
         depositMethod: reservationsTable.depositMethod,
+        cashRegisterSessionId: reservationsTable.cashRegisterSessionId,
+        createdAt: reservationsTable.createdAt,
       }).from(reservationsTable).where(and(
-        eq(reservationsTable.cashRegisterSessionId, sessionId),
         sql`CAST(${reservationsTable.deposit} AS NUMERIC) > 0`,
         sql`${reservationsTable.status} != 'cancelada'`,
         sql`${reservationsTable.depositRefunded} = false`,
         sql`NOT EXISTS (SELECT 1 FROM sales s WHERE s.id = ${reservationsTable.saleId} AND s.status = 'cancelada')`,
+        or(
+          eq(reservationsTable.cashRegisterSessionId, sessionId),
+          sql`EXISTS (
+            SELECT 1 FROM reservation_payments rp
+            WHERE rp.reservation_id = ${reservationsTable.id}
+              AND rp.cash_register_session_id = ${sessionId}
+          )`,
+        ),
       ));
       const resvPayments = reservations.length
         ? await tx.select().from(reservationPaymentsTable).where(inArray(reservationPaymentsTable.reservationId, reservations.map(r => r.id)))
         : [];
       let cashDeposits = 0;
       for (const resv of reservations) {
-        const pList = resvPayments.filter(p => p.reservationId === resv.id);
-        const effectivePayments = pList.length
-          ? pList.map(p => ({ paymentMethod: p.paymentMethod, amount: Number(p.amount) }))
-          : [{ paymentMethod: resv.depositMethod || "Efectivo", amount: Number(resv.deposit) }];
+        const effectivePayments = getPaymentsForSessions(
+          resv,
+          resvPayments.filter((payment) => payment.reservationId === resv.id),
+          [sessionId],
+          session.businessDate,
+        );
         cashDeposits += effectivePayments
           .filter(p => p.paymentMethod.toLowerCase().includes("efectivo"))
           .reduce((sum, p) => sum + p.amount, 0);

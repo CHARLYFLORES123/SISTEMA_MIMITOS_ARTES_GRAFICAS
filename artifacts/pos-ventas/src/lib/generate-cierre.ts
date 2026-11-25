@@ -128,8 +128,6 @@ export function computeCierreData(sales: CierreSale[], date: string, deposits?: 
   let countDirectSales = 0;
   let countReservationDeliveries = 0;
 
-  const deliveredResvIds = new Set<number>();
-
   for (const s of completed) {
     const isResv = Boolean(
       s.isReservationDelivery ||
@@ -150,8 +148,6 @@ export function computeCierreData(sales: CierreSale[], date: string, deposits?: 
         if (m) deposit = Number(m[1]);
       }
       const depAmount = Math.max(0, deposit ?? 0);
-      if (resvId) deliveredResvIds.add(resvId);
-
       const balance = Number(
         s.reservationBalance != null
           ? s.reservationBalance
@@ -188,20 +184,10 @@ export function computeCierreData(sales: CierreSale[], date: string, deposits?: 
     }
   }
 
-  // Active (not delivered today) deposits from the register session deposits list
-  const pendingDepositsList: CierreDeposit[] = [];
-  let pendingDepositsAmount = 0;
-  if (deposits && deposits.length > 0) {
-    for (const dep of deposits) {
-      if (!deliveredResvIds.has(dep.id)) {
-        pendingDepositsList.push(dep);
-        pendingDepositsAmount += dep.deposit;
-      }
-    }
-  }
-
-  const deliveredDepositsAmount = deliveredReservations.reduce((acc, dr) => acc + dr.deposit, 0);
-  const totalDeposits = Math.round((deliveredDepositsAmount + pendingDepositsAmount + Number.EPSILON) * 100) / 100;
+  // The register session contains only deposits received on this business date,
+  // including deposits for reservations delivered today.
+  const dayDeposits = deposits ?? [];
+  const totalDeposits = Math.round((dayDeposits.reduce((sum, deposit) => sum + deposit.deposit, 0) + Number.EPSILON) * 100) / 100;
   totalDirectSales = Math.round((totalDirectSales + Number.EPSILON) * 100) / 100;
   totalReservationBalances = Math.round((totalReservationBalances + Number.EPSILON) * 100) / 100;
   const grandTotal = Math.round((totalDirectSales + totalReservationBalances + totalDeposits + Number.EPSILON) * 100) / 100;
@@ -242,18 +228,15 @@ export function computeCierreData(sales: CierreSale[], date: string, deposits?: 
     }
   }
 
-  // 2. Delivered Reservations: both Saldo a cobrar AND Adelanto
+  // 2. Delivered Reservations: the remaining balance is collected on delivery.
   for (const dr of deliveredReservations) {
     for (const p of dr.balancePayments) {
       addPayment(p.paymentMethod, p.amount);
     }
-    for (const p of dr.depositPayments) {
-      addPayment(p.paymentMethod, p.amount);
-    }
   }
 
-  // 3. New pending reservation deposits
-  for (const dep of pendingDepositsList) {
+  // 3. Reservation deposits received in this register session
+  for (const dep of dayDeposits) {
     const payments = dep.payments?.length
       ? dep.payments
       : [{ paymentMethod: dep.depositMethod || "Efectivo", amount: dep.deposit }];
@@ -264,7 +247,7 @@ export function computeCierreData(sales: CierreSale[], date: string, deposits?: 
 
   const totalSubtotal = completed.reduce((sum, s) => sum + s.subtotal, 0);
   const totalIva = completed.reduce((sum, s) => sum + s.iva, 0);
-  const countNewDeposits = pendingDepositsList.length;
+  const countNewDeposits = dayDeposits.length;
 
   return {
     date,

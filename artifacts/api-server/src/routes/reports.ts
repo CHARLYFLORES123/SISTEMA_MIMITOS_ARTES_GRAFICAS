@@ -10,6 +10,7 @@ import {
   reservationPaymentsTable,
   reservationDetailsTable,
   customersTable,
+  cashRegisterSessionsTable,
 } from "@workspace/db";
 import { eq, gte, lte, and, or, count, sum, sql, desc, inArray } from "drizzle-orm";
 import { verifyToken } from "../middlewares/auth";
@@ -48,6 +49,17 @@ function normalizeDateStr(val: any, fallback: Date): string {
   return getLocalDateKey(fallback);
 }
 
+function getBusinessDateKey(date: Date): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/La_Paz",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
 // GET /api/reports/sales-by-seller-daily — Ventas y adelantos por vendedor por día con productos
 router.get("/sales-by-seller-daily", async (req, res) => {
   const { from, to } = parseDateRange(req.query);
@@ -58,9 +70,14 @@ router.get("/sales-by-seller-daily", async (req, res) => {
   try {
     // 0. Obtener entregas de reservas en salesTable para no duplicarlas como ventas directas
     const deliveredReservations = await db
-      .select({ saleId: reservationsTable.saleId })
+      .select({ reservationId: reservationsTable.id, saleId: reservationsTable.saleId })
       .from(reservationsTable)
       .where(sql`${reservationsTable.saleId} IS NOT NULL`);
+    const reservationIdBySaleId = new Map<number, number>(
+      deliveredReservations
+        .filter((row): row is { reservationId: number; saleId: number } => row.saleId !== null)
+        .map((row) => [row.saleId, row.reservationId]),
+    );
     const deliveredSaleIdSet = new Set<number>(
       deliveredReservations.map((r) => r.saleId!).filter(Boolean)
     );
@@ -115,16 +132,54 @@ router.get("/sales-by-seller-daily", async (req, res) => {
     }
 
     if (dateFromStr && dateToStr) {
-      dateFilters.push(
-        and(
-          sql`CAST(${reservationsTable.reservationDate} AS text) >= ${dateFromStr}`,
-          sql`CAST(${reservationsTable.reservationDate} AS text) <= ${dateToStr}`
-        )
+      const paymentDate = sql`COALESCE(
+        crs.business_date,
+        to_char(rp.created_at AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD')
+      )`;
+      const paymentDateFilters = [
+        sql`${paymentDate} >= ${dateFromStr}`,
+        sql`${paymentDate} <= ${dateToStr}`,
+      ];
+      const reservationDateFilters = and(
+        sql`CAST(${reservationsTable.reservationDate} AS text) >= ${dateFromStr}`,
+        sql`CAST(${reservationsTable.reservationDate} AS text) <= ${dateToStr}`,
       );
+      dateFilters.push(or(
+        sql`EXISTS (
+          SELECT 1 FROM reservation_payments rp
+          LEFT JOIN cash_register_sessions crs ON crs.id = rp.cash_register_session_id
+          WHERE rp.reservation_id = ${reservationsTable.id}
+            AND ${and(...paymentDateFilters)}
+        )`,
+        and(
+          sql`NOT EXISTS (
+            SELECT 1 FROM reservation_payments rp
+            WHERE rp.reservation_id = ${reservationsTable.id}
+          )`,
+          reservationDateFilters,
+        ),
+        reservationDateFilters,
+      )!);
     } else if (dateFromStr) {
-      dateFilters.push(sql`CAST(${reservationsTable.reservationDate} AS text) >= ${dateFromStr}`);
+      dateFilters.push(or(
+        sql`EXISTS (
+          SELECT 1 FROM reservation_payments rp
+          LEFT JOIN cash_register_sessions crs ON crs.id = rp.cash_register_session_id
+          WHERE rp.reservation_id = ${reservationsTable.id}
+            AND COALESCE(crs.business_date, to_char(rp.created_at AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD')) >= ${dateFromStr}
+        )`,
+        sql`CAST(${reservationsTable.reservationDate} AS text) >= ${dateFromStr}`,
+      )!);
     } else if (dateToStr) {
-      dateFilters.push(sql`CAST(${reservationsTable.reservationDate} AS text) <= ${dateToStr}`);
+      dateFilters.push(or(
+        sql`EXISTS (
+          SELECT 1 FROM reservation_payments rp
+          LEFT JOIN cash_register_sessions crs ON crs.id = rp.cash_register_session_id
+          WHERE rp.reservation_id = ${reservationsTable.id}
+            AND COALESCE(crs.business_date, to_char(rp.created_at AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD')) <= ${dateToStr}
+        )`,
+        sql`CAST(${reservationsTable.reservationDate} AS text) <= ${dateToStr}`,
+      )!);
     }
 
     if (dateFilters.length > 0) {
@@ -152,6 +207,41 @@ router.get("/sales-by-seller-daily", async (req, res) => {
       .leftJoin(customersTable, eq(reservationsTable.customerId, customersTable.id))
       .where(and(...depositConditions))
       .orderBy(desc(reservationsTable.createdAt), desc(reservationsTable.id));
+
+    const depositReservationIds = depositRows.map((row) => row.reservationId);
+    const reservationPaymentRows = depositReservationIds.length
+      ? await db.select().from(reservationPaymentsTable)
+        .where(inArray(reservationPaymentsTable.reservationId, depositReservationIds))
+        .orderBy(reservationPaymentsTable.id)
+      : [];
+    const paymentSessionIds = [...new Set(
+      reservationPaymentRows
+        .map((payment) => payment.cashRegisterSessionId)
+        .filter((sessionId): sessionId is number => sessionId !== null),
+    )];
+    const paymentSessions = paymentSessionIds.length
+      ? await db.select({
+          id: cashRegisterSessionsTable.id,
+          businessDate: cashRegisterSessionsTable.businessDate,
+        }).from(cashRegisterSessionsTable)
+          .where(inArray(cashRegisterSessionsTable.id, paymentSessionIds))
+      : [];
+    const businessDateBySession = new Map(paymentSessions.map((session) => [session.id, session.businessDate]));
+    const paymentEventsByReservation = new Map<number, Array<{
+      paymentMethod: string;
+      amount: number;
+      businessDate: string;
+    }>>();
+    for (const payment of reservationPaymentRows) {
+      const events = paymentEventsByReservation.get(payment.reservationId) ?? [];
+      events.push({
+        paymentMethod: payment.paymentMethod,
+        amount: Number(payment.amount),
+        businessDate: (payment.cashRegisterSessionId && businessDateBySession.get(payment.cashRegisterSessionId))
+          || getBusinessDateKey(payment.createdAt),
+      });
+      paymentEventsByReservation.set(payment.reservationId, events);
+    }
 
     // Obtener lista completa de vendedores para el selector
     const sellersList = await db
@@ -197,6 +287,7 @@ router.get("/sales-by-seller-daily", async (req, res) => {
       grandTotal: number;
       saleIds: Set<number>;
       reservationIds: Set<number>;
+      balanceReservationIds: Set<number>;
       productsMap: Map<string, ProductItem>;
       depositsList: DepositItem[];
     }
@@ -220,6 +311,7 @@ router.get("/sales-by-seller-daily", async (req, res) => {
           grandTotal: 0,
           saleIds: new Set<number>(),
           reservationIds: new Set<number>(),
+          balanceReservationIds: new Set<number>(),
           productsMap: new Map<string, ProductItem>(),
           depositsList: [],
         };
@@ -229,10 +321,17 @@ router.get("/sales-by-seller-daily", async (req, res) => {
     };
 
     // Procesar filas de ventas directas (excluyendo entregas de reserva para evitar doble conteo)
+    const deliveryDateByReservation = new Map<number, string>();
     for (const row of rows) {
       const isResvDelivery =
         deliveredSaleIdSet.has(row.saleId) ||
         Boolean(row.saleNotes && row.saleNotes.includes("Entrega de reserva #"));
+      if (isResvDelivery) {
+        const reservationId = reservationIdBySaleId.get(row.saleId);
+        if (reservationId) {
+          deliveryDateByReservation.set(reservationId, getBusinessDateKey(new Date(row.saleCreatedAt)));
+        }
+      }
       if (isResvDelivery) continue;
 
       const dateKey = getLocalDateKey(new Date(row.saleCreatedAt));
@@ -262,34 +361,61 @@ router.get("/sales-by-seller-daily", async (req, res) => {
       }
     }
 
-    // Procesar filas de reservas (adelantos y saldos a cobrar)
+    const isInSelectedDateRange = (date: string) =>
+      (!dateFromStr || date >= dateFromStr) && (!dateToStr || date <= dateToStr);
+
+    // Los adelantos se agrupan por fecha real de recepción, no por fecha de reserva.
     for (const depRow of depositRows) {
-      const dateKey = normalizeDateStr(depRow.reservationDate, new Date(depRow.createdAt));
       const uid = depRow.userId ?? 0;
-      const group = getOrCreateGroup(dateKey, uid, depRow.userName, depRow.userRole);
+      const currentDeposit = Number(depRow.deposit || 0);
+      const total = Number(depRow.total || 0);
+      const balance = Math.max(0, total - currentDeposit);
+      const reservationDate = normalizeDateStr(depRow.reservationDate, new Date(depRow.createdAt));
+      if (isInSelectedDateRange(reservationDate)) {
+        getOrCreateGroup(reservationDate, uid, depRow.userName, depRow.userRole);
+      }
+      const events = paymentEventsByReservation.get(depRow.reservationId) ?? (currentDeposit > 0
+        ? [{
+          paymentMethod: depRow.depositMethod || "Efectivo",
+          amount: currentDeposit,
+          businessDate: getBusinessDateKey(depRow.createdAt),
+        }]
+        : []);
+      const eventsByDate = new Map<string, typeof events>();
+      for (const event of events) {
+        if (!isInSelectedDateRange(event.businessDate)) continue;
+        const eventsOnDate = eventsByDate.get(event.businessDate) ?? [];
+        eventsOnDate.push(event);
+        eventsByDate.set(event.businessDate, eventsOnDate);
+      }
 
-      if (!group.reservationIds.has(depRow.reservationId)) {
-        group.reservationIds.add(depRow.reservationId);
-        const depAmt = Number(depRow.deposit || 0);
-        const totAmt = Number(depRow.total || 0);
-        const balAmt = Math.max(0, totAmt - depAmt);
-        // Solo sumar el saldo a cobrar cuando la reserva está Entregada (y por tanto cobrada).
-        // Si no está entregada, el saldo queda pendiente y solo se cuenta el adelanto.
-        const isDelivered = depRow.status === "entregada" || Boolean(depRow.saleId);
-
-        group.depositsCount += 1;
-        group.depositsAmount += depAmt;
-        group.balancesAmount += isDelivered ? balAmt : 0;
+      for (const [dateKey, dateEvents] of eventsByDate) {
+        const group = getOrCreateGroup(dateKey, uid, depRow.userName, depRow.userRole);
+        const dayAmount = Number(dateEvents.reduce((sum, event) => sum + event.amount, 0).toFixed(2));
+        if (!group.reservationIds.has(depRow.reservationId)) {
+          group.reservationIds.add(depRow.reservationId);
+          group.depositsCount += 1;
+        }
+        group.depositsAmount += dayAmount;
         group.depositsList.push({
           reservationId: depRow.reservationId,
           customerName: depRow.customerName || "Sin cliente",
-          deposit: depAmt,
-          balance: Number(balAmt.toFixed(2)),
-          total: totAmt,
-          depositMethod: depRow.depositMethod || "Efectivo",
+          deposit: dayAmount,
+          balance: Number(balance.toFixed(2)),
+          total,
+          depositMethod: [...new Set(dateEvents.map((event) => event.paymentMethod))].join(" / "),
           status: depRow.status,
           date: dateKey,
         });
+      }
+
+      const deliveryDate = deliveryDateByReservation.get(depRow.reservationId);
+      if (deliveryDate && balance > 0 && isInSelectedDateRange(deliveryDate)) {
+        const group = getOrCreateGroup(deliveryDate, uid, depRow.userName, depRow.userRole);
+        if (!group.balanceReservationIds.has(depRow.reservationId)) {
+          group.balanceReservationIds.add(depRow.reservationId);
+          group.balancesAmount += balance;
+        }
       }
     }
 
@@ -311,7 +437,9 @@ router.get("/sales-by-seller-daily", async (req, res) => {
       for (const depRow of depositRows) {
         const dateKey = normalizeDateStr(depRow.reservationDate, new Date(depRow.createdAt));
         const uid = depRow.userId ?? 0;
-        resMeta.set(depRow.reservationId, { dateKey, uid });
+        if (isInSelectedDateRange(dateKey)) {
+          resMeta.set(depRow.reservationId, { dateKey, uid });
+        }
       }
 
       for (const rd of resDetails) {
@@ -407,7 +535,6 @@ router.get("/sales-by-seller-daily", async (req, res) => {
 
 // GET /api/reports/reservation-deposits — Detalle completo de adelantos recibidos en reservas
 router.get("/reservation-deposits", async (req, res) => {
-  const { from, to } = parseDateRange(req.query);
   const dateFromStr = typeof req.query.dateFrom === "string" ? req.query.dateFrom : undefined;
   const dateToStr = typeof req.query.dateTo === "string" ? req.query.dateTo : undefined;
   const userId = req.query.userId ? Number(req.query.userId) : undefined;
@@ -427,30 +554,43 @@ router.get("/reservation-deposits", async (req, res) => {
       whereConditions.push(eq(reservationsTable.status, status));
     }
 
-    const dateFilters = [];
-    if (from && to) {
-      dateFilters.push(and(gte(reservationsTable.createdAt, from), lte(reservationsTable.createdAt, to)));
-    } else if (from) {
-      dateFilters.push(gte(reservationsTable.createdAt, from));
-    } else if (to) {
-      dateFilters.push(lte(reservationsTable.createdAt, to));
-    }
+    if (dateFromStr || dateToStr) {
+      const paymentDate = sql`COALESCE(
+        crs.business_date,
+        to_char(rp.created_at AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD')
+      )`;
+      const paymentDateFilters = [];
+      if (dateFromStr) paymentDateFilters.push(sql`${paymentDate} >= ${dateFromStr}`);
+      if (dateToStr) paymentDateFilters.push(sql`${paymentDate} <= ${dateToStr}`);
 
-    if (dateFromStr && dateToStr) {
-      dateFilters.push(
+      const legacyDateFilters = [];
+      if (dateFromStr) {
+        legacyDateFilters.push(sql`(
+          CAST(${reservationsTable.reservationDate} AS text) >= ${dateFromStr}
+          OR to_char(${reservationsTable.createdAt} AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD') >= ${dateFromStr}
+        )`);
+      }
+      if (dateToStr) {
+        legacyDateFilters.push(sql`(
+          CAST(${reservationsTable.reservationDate} AS text) <= ${dateToStr}
+          OR to_char(${reservationsTable.createdAt} AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD') <= ${dateToStr}
+        )`);
+      }
+      whereConditions.push(or(
+        sql`EXISTS (
+          SELECT 1 FROM reservation_payments rp
+          LEFT JOIN cash_register_sessions crs ON crs.id = rp.cash_register_session_id
+          WHERE rp.reservation_id = ${reservationsTable.id}
+            AND ${and(...paymentDateFilters)}
+        )`,
         and(
-          sql`CAST(${reservationsTable.reservationDate} AS text) >= ${dateFromStr}`,
-          sql`CAST(${reservationsTable.reservationDate} AS text) <= ${dateToStr}`
-        )
-      );
-    } else if (dateFromStr) {
-      dateFilters.push(sql`CAST(${reservationsTable.reservationDate} AS text) >= ${dateFromStr}`);
-    } else if (dateToStr) {
-      dateFilters.push(sql`CAST(${reservationsTable.reservationDate} AS text) <= ${dateToStr}`);
-    }
-
-    if (dateFilters.length > 0) {
-      whereConditions.push(or(...dateFilters)!);
+          sql`NOT EXISTS (
+            SELECT 1 FROM reservation_payments rp
+            WHERE rp.reservation_id = ${reservationsTable.id}
+          )`,
+          and(...legacyDateFilters),
+        ),
+      )!);
     }
 
     const rows = await db
@@ -498,10 +638,26 @@ router.get("/reservation-deposits", async (req, res) => {
           .orderBy(reservationDetailsTable.id)
       : [];
 
-    const paymentsByResId = new Map<number, Array<{ paymentMethod: string; amount: number }>>();
+    const paymentSessionIds = [...new Set(payments.map((payment) => payment.cashRegisterSessionId).filter((value): value is number => value !== null))];
+    const paymentSessions = paymentSessionIds.length
+      ? await db.select({
+          id: cashRegisterSessionsTable.id,
+          businessDate: cashRegisterSessionsTable.businessDate,
+        }).from(cashRegisterSessionsTable)
+          .where(inArray(cashRegisterSessionsTable.id, paymentSessionIds))
+      : [];
+    const businessDateBySession = new Map(paymentSessions.map((session) => [session.id, session.businessDate]));
+    const paymentsByResId = new Map<number, Array<{ paymentMethod: string; amount: number; createdAt: string; businessDate: string }>>();
     for (const p of payments) {
       const list = paymentsByResId.get(p.reservationId) ?? [];
-      list.push({ paymentMethod: p.paymentMethod, amount: Number(p.amount) });
+      const createdAt = p.createdAt.toISOString();
+      list.push({
+        paymentMethod: p.paymentMethod,
+        amount: Number(p.amount),
+        createdAt,
+        businessDate: (p.cashRegisterSessionId && businessDateBySession.get(p.cashRegisterSessionId))
+          || getBusinessDateKey(p.createdAt),
+      });
       paymentsByResId.set(p.reservationId, list);
     }
 
@@ -538,29 +694,40 @@ router.get("/reservation-deposits", async (req, res) => {
     const byMethod: Record<string, number> = {};
     const byStatus: Record<string, number> = {};
 
+    const hasDateFilter = Boolean(dateFromStr || dateToStr);
     const deposits = rows.map((r) => {
-      const depAmount = Number(r.deposit || 0);
+      let rPayments = paymentsByResId.get(r.id) ?? [];
+      if (rPayments.length === 0 && Number(r.deposit) > 0) {
+        rPayments = [{
+          paymentMethod: r.depositMethod || "Efectivo",
+          amount: Number(r.deposit),
+          createdAt: r.createdAt.toISOString(),
+          businessDate: getBusinessDateKey(r.createdAt),
+        }];
+      }
+      if (hasDateFilter) {
+        rPayments = rPayments.filter((payment) =>
+          (!dateFromStr || payment.businessDate >= dateFromStr)
+          && (!dateToStr || payment.businessDate <= dateToStr)
+        );
+      }
+      const depAmount = Number(rPayments.reduce((sum, payment) => sum + payment.amount, 0).toFixed(2));
+      const currentDeposit = Number(r.deposit || 0);
       const totalAmount = Number(r.total || 0);
-      const balanceAmount = Math.max(0, totalAmount - depAmount);
+      const balanceAmount = Math.max(0, totalAmount - currentDeposit);
       const isCancelled = r.status === "cancelada";
       const wasRefunded = Boolean(r.depositRefunded);
 
-      totalReservationsTotal += totalAmount;
+      if (depAmount > 0) totalReservationsTotal += totalAmount;
       if (isCancelled) {
         // Adelanto devuelto: se registra como egreso, no como ingreso neto
         totalRefundedAmount += wasRefunded ? depAmount : 0;
       } else {
         totalDepositsAmount += depAmount;
-        totalRemainingBalance += balanceAmount;
+        if (depAmount > 0) totalRemainingBalance += balanceAmount;
       }
 
-      byStatus[r.status] = (byStatus[r.status] || 0) + 1;
-
-      let rPayments = paymentsByResId.get(r.id);
-      if (!rPayments || rPayments.length === 0) {
-        const method = r.depositMethod || "Efectivo";
-        rPayments = [{ paymentMethod: method, amount: depAmount }];
-      }
+      if (depAmount > 0) byStatus[r.status] = (byStatus[r.status] || 0) + 1;
 
       // Solo sumar a métodos de pago si la reserva no fue anulada (el dinero se devolvió)
       if (!isCancelled) {
@@ -590,10 +757,10 @@ router.get("/reservation-deposits", async (req, res) => {
         notes: r.notes,
         saleId: r.saleId,
         createdAt: r.createdAt.toISOString(),
-        payments: rPayments,
+        payments: rPayments.map(({ paymentMethod, amount, createdAt }) => ({ paymentMethod, amount, createdAt })),
         products: detailsByResId.get(r.id) ?? [],
       };
-    });
+    }).filter((deposit) => deposit.deposit > 0);
 
     const totalCount = deposits.length;
     const averageDeposit = totalCount > 0 ? Number((totalDepositsAmount / totalCount).toFixed(2)) : 0;
@@ -708,16 +875,39 @@ router.get("/sales-by-user", async (req, res) => {
       dateFilters.push(lte(reservationsTable.createdAt, to));
     }
     if (dateFromStr && dateToStr) {
-      dateFilters.push(
+      dateFilters.push(or(
+        sql`EXISTS (
+          SELECT 1 FROM reservation_payments rp
+          LEFT JOIN cash_register_sessions crs ON crs.id = rp.cash_register_session_id
+          WHERE rp.reservation_id = ${reservationsTable.id}
+            AND COALESCE(crs.business_date, to_char(rp.created_at AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD')) >= ${dateFromStr}
+            AND COALESCE(crs.business_date, to_char(rp.created_at AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD')) <= ${dateToStr}
+        )`,
         and(
           sql`CAST(${reservationsTable.reservationDate} AS text) >= ${dateFromStr}`,
           sql`CAST(${reservationsTable.reservationDate} AS text) <= ${dateToStr}`
-        )
-      );
+        ),
+      )!);
     } else if (dateFromStr) {
-      dateFilters.push(sql`CAST(${reservationsTable.reservationDate} AS text) >= ${dateFromStr}`);
+      dateFilters.push(or(
+        sql`EXISTS (
+          SELECT 1 FROM reservation_payments rp
+          LEFT JOIN cash_register_sessions crs ON crs.id = rp.cash_register_session_id
+          WHERE rp.reservation_id = ${reservationsTable.id}
+            AND COALESCE(crs.business_date, to_char(rp.created_at AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD')) >= ${dateFromStr}
+        )`,
+        sql`CAST(${reservationsTable.reservationDate} AS text) >= ${dateFromStr}`,
+      )!);
     } else if (dateToStr) {
-      dateFilters.push(sql`CAST(${reservationsTable.reservationDate} AS text) <= ${dateToStr}`);
+      dateFilters.push(or(
+        sql`EXISTS (
+          SELECT 1 FROM reservation_payments rp
+          LEFT JOIN cash_register_sessions crs ON crs.id = rp.cash_register_session_id
+          WHERE rp.reservation_id = ${reservationsTable.id}
+            AND COALESCE(crs.business_date, to_char(rp.created_at AT TIME ZONE 'America/La_Paz', 'YYYY-MM-DD')) <= ${dateToStr}
+        )`,
+        sql`CAST(${reservationsTable.reservationDate} AS text) <= ${dateToStr}`,
+      )!);
     }
 
     if (dateFilters.length > 0) {
@@ -733,16 +923,67 @@ router.get("/sales-by-user", async (req, res) => {
         total: reservationsTable.total,
         status: reservationsTable.status,
         saleId: reservationsTable.saleId,
+        createdAt: reservationsTable.createdAt,
       })
       .from(reservationsTable)
       .leftJoin(usersTable, eq(reservationsTable.userId, usersTable.id))
       .where(and(...depositConditions));
 
+    const userReservationIds = resUserRows.map((row) => row.id);
+    const userPayments = userReservationIds.length
+      ? await db.select().from(reservationPaymentsTable)
+        .where(inArray(reservationPaymentsTable.reservationId, userReservationIds))
+      : [];
+    const userPaymentSessionIds = [...new Set(
+      userPayments
+        .map((payment) => payment.cashRegisterSessionId)
+        .filter((sessionId): sessionId is number => sessionId !== null),
+    )];
+    const userPaymentSessions = userPaymentSessionIds.length
+      ? await db.select({
+          id: cashRegisterSessionsTable.id,
+          businessDate: cashRegisterSessionsTable.businessDate,
+        }).from(cashRegisterSessionsTable)
+          .where(inArray(cashRegisterSessionsTable.id, userPaymentSessionIds))
+      : [];
+    const userBusinessDates = new Map(userPaymentSessions.map((session) => [session.id, session.businessDate]));
+    const userPaymentsByReservation = new Map<number, Array<{ paymentMethod: string; amount: number; businessDate: string }>>();
+    for (const payment of userPayments) {
+      const list = userPaymentsByReservation.get(payment.reservationId) ?? [];
+      list.push({
+        paymentMethod: payment.paymentMethod,
+        amount: Number(payment.amount),
+        businessDate: (payment.cashRegisterSessionId && userBusinessDates.get(payment.cashRegisterSessionId))
+          || getBusinessDateKey(payment.createdAt),
+      });
+      userPaymentsByReservation.set(payment.reservationId, list);
+    }
+
+    const deliveredSaleIds = resUserRows
+      .map((reservation) => reservation.saleId)
+      .filter((saleId): saleId is number => saleId !== null);
+    const deliverySales = deliveredSaleIds.length
+      ? await db.select({
+          id: salesTable.id,
+          createdAt: salesTable.createdAt,
+        }).from(salesTable)
+          .where(inArray(salesTable.id, deliveredSaleIds))
+      : [];
+    const deliveryDateBySale = new Map(deliverySales.map((sale) => [sale.id, getBusinessDateKey(sale.createdAt)]));
+    const isInSelectedDateRange = (date: string) =>
+      (!dateFromStr || date >= dateFromStr) && (!dateToStr || date <= dateToStr);
+
     for (const r of resUserRows) {
       const uid = r.userId ?? 0;
-      const depAmt = Number(r.deposit || 0);
+      const recordedPayments = userPaymentsByReservation.get(r.id) ?? [];
+      const effectivePayments = recordedPayments.length > 0
+        ? recordedPayments.filter((payment) => isInSelectedDateRange(payment.businessDate))
+        : (Number(r.deposit) > 0 && isInSelectedDateRange(getBusinessDateKey(r.createdAt))
+          ? [{ paymentMethod: "Efectivo", amount: Number(r.deposit), businessDate: getBusinessDateKey(r.createdAt) }]
+          : []);
+      const depAmt = Number(effectivePayments.reduce((sum, payment) => sum + payment.amount, 0).toFixed(2));
       const totAmt = Number(r.total || 0);
-      const balAmt = Math.max(0, totAmt - depAmt);
+      const balAmt = Math.max(0, totAmt - Number(r.deposit || 0));
 
       let existing = userMap.get(uid);
       if (!existing) {
@@ -763,9 +1004,13 @@ router.get("/sales-by-user", async (req, res) => {
       const isDelivered = r.status === "entregada" || Boolean(r.saleId);
       const balCounted = isDelivered ? balAmt : 0;
 
-      existing.totalDepositsCount += 1;
+      if (depAmt > 0) existing.totalDepositsCount += 1;
       existing.totalDepositsAmount = Number((existing.totalDepositsAmount + depAmt).toFixed(2));
-      existing.totalBalancesAmount = Number((existing.totalBalancesAmount + balCounted).toFixed(2));
+      const deliveryDate = r.saleId ? deliveryDateBySale.get(r.saleId) : undefined;
+      const balanceForPeriod = !dateFromStr && !dateToStr
+        ? balCounted
+        : (deliveryDate && isInSelectedDateRange(deliveryDate) ? balCounted : 0);
+      existing.totalBalancesAmount = Number((existing.totalBalancesAmount + balanceForPeriod).toFixed(2));
       // Total Recaudado = Monto Adelanto + Saldo a Cobrar de la Reserva (solo si está entregada)
       existing.grandTotal = Number(
         (existing.totalDepositsAmount + existing.totalBalancesAmount).toFixed(2)

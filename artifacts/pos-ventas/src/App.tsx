@@ -70,6 +70,7 @@ class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
 
 import Login from "@/pages/login";
 import Register from "@/pages/register";
+import Home from "@/pages/home";
 import { Layout } from "@/components/layout";
 import Dashboard from "@/pages/dashboard";
 import POS from "@/pages/pos";
@@ -130,7 +131,8 @@ function AuthenticatedRoutes() {
 function Router() {
   return (
     <Switch>
-      <Route path="/" component={Login} />
+      <Route path="/" component={Home} />
+      <Route path="/login" component={Login} />
       <Route path="/register" component={Register} />
       <Route component={AuthenticatedRoutes} />
     </Switch>
@@ -145,7 +147,7 @@ function App() {
     fetch(`${baseApiUrl}/business-settings/public`)
       .then((response) => (response.ok ? response.json() : null))
       .then((data) => {
-        const companyName = data?.companyName || "POS Ventas";
+        const companyName = data?.companyName || "MIMITOS ARTES GRÁFICAS";
         document.title = companyName;
 
         if (data?.logoUrl) {
@@ -160,7 +162,7 @@ function App() {
         }
       })
       .catch(() => {
-        document.title = "POS Ventas";
+        document.title = "MIMITOS ARTES GRÁFICAS";
       });
   }, []);
 
