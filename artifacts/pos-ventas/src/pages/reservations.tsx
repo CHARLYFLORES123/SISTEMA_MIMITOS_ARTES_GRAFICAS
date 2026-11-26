@@ -174,6 +174,8 @@ export default function Reservations() {
   const [customerId, setCustomerId] = useState("none");
   const [customerOpen, setCustomerOpen] = useState(false);
   const [customerSearch, setCustomerSearch] = useState("");
+  const [productOpenIndex, setProductOpenIndex] = useState<number | null>(null);
+  const [productSearch, setProductSearch] = useState("");
 
   const selectedCustomer = useMemo(() => {
     if (customerId === "none") return null;
@@ -189,6 +191,13 @@ export default function Reservations() {
       (c.nitCi && c.nitCi.toLowerCase().includes(q))
     );
   }, [customers, customerSearch]);
+  const filteredProductList = useMemo(() => {
+    const query = productSearch.trim().toLowerCase();
+    return (products || []).filter((product) =>
+      !query || [product.name, product.size, product.color]
+        .some((value) => value?.toLowerCase().includes(query))
+    );
+  }, [products, productSearch]);
   const [showNewCustomer, setShowNewCustomer] = useState(false);
   const [newCustomerName, setNewCustomerName] = useState("");
   const [newCustomerPhone, setNewCustomerPhone] = useState("");
@@ -821,24 +830,83 @@ export default function Reservations() {
             )}
 
             <div className="space-y-3">
-              {details.map((detail, index) => (
+              {details.map((detail, index) => {
+                const selectedProduct = products?.find((product) => String(product.id) === detail.productId);
+                return (
                 <div key={index} className="grid gap-3 rounded-xl border bg-muted/20 p-3 sm:grid-cols-2 lg:grid-cols-[2fr_1.2fr_0.7fr_1fr_auto]">
-                  <label className="space-y-1.5 text-sm">
+                  <div className="space-y-1.5 text-sm">
                     <span className="font-medium">Producto del catálogo</span>
-                    <Select value={detail.productId} onValueChange={(value) => {
-                      const product = products?.find((item) => String(item.id) === value);
-                      updateDraft(index, { productId: value, unitPrice: product ? String(product.salePrice) : "" });
-                    }}>
-                      <SelectTrigger><SelectValue placeholder="Seleccionar producto" /></SelectTrigger>
-                      <SelectContent>
-                        {products?.map((product) => (
-                          <SelectItem key={product.id} value={String(product.id)}>
-                            {product.name}{product.size ? ` · ${product.size}` : ""}{product.color ? ` · ${product.color}` : ""}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </label>
+                    <Popover
+                      open={productOpenIndex === index}
+                      onOpenChange={(open) => {
+                        setProductOpenIndex(open ? index : null);
+                        if (!open) setProductSearch("");
+                      }}
+                    >
+                      <PopoverTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          role="combobox"
+                          aria-expanded={productOpenIndex === index}
+                          className="h-9 w-full justify-between px-3 text-left font-normal"
+                        >
+                          <span className="truncate">
+                            {selectedProduct
+                              ? `${selectedProduct.name}${selectedProduct.size ? ` · ${selectedProduct.size}` : ""}${selectedProduct.color ? ` · ${selectedProduct.color}` : ""}`
+                              : "Seleccionar producto"}
+                          </span>
+                          <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                        </Button>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-[320px] p-2" align="start">
+                        <div className="relative mb-2">
+                          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                          <Input
+                            autoFocus
+                            value={productSearch}
+                            onChange={(event) => setProductSearch(event.target.value)}
+                            placeholder="Buscar por nombre, talla o color..."
+                            className="h-9 pl-8 text-sm"
+                          />
+                        </div>
+                        <div className="max-h-60 space-y-0.5 overflow-y-auto">
+                          {filteredProductList.length > 0 ? (
+                            filteredProductList.map((product) => {
+                              const value = String(product.id);
+                              const isSelected = detail.productId === value;
+                              return (
+                                <button
+                                  key={product.id}
+                                  type="button"
+                                  onClick={() => {
+                                    updateDraft(index, {
+                                      productId: value,
+                                      unitPrice: String(product.salePrice),
+                                    });
+                                    setProductOpenIndex(null);
+                                    setProductSearch("");
+                                  }}
+                                  className={`flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-left text-sm hover:bg-accent ${
+                                    isSelected ? "bg-accent font-semibold" : ""
+                                  }`}
+                                >
+                                  <span className="truncate">
+                                    {product.name}{product.size ? ` · ${product.size}` : ""}{product.color ? ` · ${product.color}` : ""}
+                                  </span>
+                                  {isSelected && <Check className="ml-2 h-4 w-4 shrink-0 text-primary" />}
+                                </button>
+                              );
+                            })
+                          ) : (
+                            <p className="px-2.5 py-4 text-center text-sm text-muted-foreground">
+                              {productSearch.trim() ? "No se encontraron productos." : "No hay productos disponibles."}
+                            </p>
+                          )}
+                        </div>
+                      </PopoverContent>
+                    </Popover>
+                  </div>
                   <label className="space-y-1.5 text-sm">
                     <span className="font-medium">Detalles del diseño / producto</span>
                     <Input value={detail.specifications} onChange={(event) => updateDraft(index, { specifications: event.target.value })} placeholder="Color, nombre, talla, imagen..." />
@@ -857,7 +925,8 @@ export default function Reservations() {
                     </Button>
                   </div>
                 </div>
-              ))}
+                );
+              })}
               <Button type="button" variant="outline" size="sm" onClick={() => setDetails((current) => [...current, emptyDetail()])}>
                 <Plus className="mr-1.5 h-4 w-4" /> Agregar producto
               </Button>
